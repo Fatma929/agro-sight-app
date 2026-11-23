@@ -47,14 +47,20 @@ jobs:
       - name: Run Live Sentinel-2 STAC & AWS S3 COG End-to-End Integration Test
         run: PYTHONPATH=backend python3 backend/test_live_sentinel2_integration.py
 
+      - name: Ensure Gradle Wrapper is Executable
+        run: chmod +x ./gradlew
+
+      - name: Verify Gradle Wrapper Version
+        run: ./gradlew --version
+
       - name: Run Android Unit & Robolectric Tests
-        run: gradle :app:testDebugUnitTest
+        run: ./gradlew :app:testDebugUnitTest
 
       - name: Assemble Debug APK
-        run: gradle :app:assembleDebug
+        run: ./gradlew :app:assembleDebug
 
       - name: Compile Release Kotlin & Verify R8 Configuration
-        run: gradle :app:compileReleaseKotlin
+        run: ./gradlew :app:compileReleaseKotlin
 
       - name: Install Firebase Rules Unit Testing Dependencies
         if: hashFiles('package.json') != ''

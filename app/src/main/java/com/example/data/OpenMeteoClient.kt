@@ -24,6 +24,9 @@ import kotlin.math.roundToInt
 enum class TelemetryDataMode(val badgeAr: String) {
     LIVE("بيانات حية (LIVE)"),
     CACHED("بيانات مخزنة مؤقتاً (CACHED)"),
+    FALLBACK("بيانات احتياطية غير حية (FALLBACK)"),
+    DEMO("وضع تجريبي (DEMO)"),
+    UNAVAILABLE("بيانات غير متوفرة (UNAVAILABLE)"),
     DEMO_ESTIMATED("وضع تجريبي / تقديري (DEMO / ESTIMATED)")
 }
 
@@ -35,9 +38,46 @@ data class OpenMeteoResult(
     val httpStatusCode: Int = 0,
     val latencyMs: Long = 0L,
     val lastSuccessfulSyncIso: String = "",
-    val dataMode: TelemetryDataMode = if (isLiveConnected) TelemetryDataMode.LIVE else TelemetryDataMode.DEMO_ESTIMATED,
-    val errorDetailAr: String? = null
-)
+    val dataMode: TelemetryDataMode = if (isLiveConnected) TelemetryDataMode.LIVE else TelemetryDataMode.FALLBACK,
+    val errorDetailAr: String? = null,
+    val source: String = if (isLiveConnected) {
+        "Open-Meteo FAO-56 Penman-Monteith API"
+    } else {
+        "Offline Agro-Climatic Fallback Baseline"
+    },
+    val observationTimestampIso: String = records.firstOrNull()?.dateIso.orEmpty(),
+    val retrievalTimestampIso: String = lastSuccessfulSyncIso,
+    val units: Map<String, String> = DEFAULT_WEATHER_UNITS
+) {
+    init {
+        require(!(dataMode == TelemetryDataMode.LIVE && !isLiveConnected)) {
+            "Weather provenance violation: LIVE dataMode requires isLiveConnected = true"
+        }
+        require(!(isLiveConnected && dataMode in setOf(
+            TelemetryDataMode.FALLBACK,
+            TelemetryDataMode.DEMO,
+            TelemetryDataMode.DEMO_ESTIMATED,
+            TelemetryDataMode.UNAVAILABLE,
+            TelemetryDataMode.CACHED
+        ))) {
+            "Weather provenance violation: non-LIVE dataMode ($dataMode) cannot have isLiveConnected = true"
+        }
+    }
+
+    companion object {
+        val DEFAULT_WEATHER_UNITS: Map<String, String> = mapOf(
+            "temperature_2m_max" to "°C",
+            "temperature_2m_min" to "°C",
+            "relative_humidity_2m" to "%",
+            "wind_speed_10m_max" to "km/h",
+            "shortwave_radiation_sum" to "MJ/m²/day",
+            "precipitation_sum" to "mm",
+            "et0_fao_evapotranspiration" to "mm/day",
+            "etc_crop_evapotranspiration" to "mm/day",
+            "water_deficit" to "m³/feddan/day"
+        )
+    }
+}
 
 interface MeteoForecastDataSource {
     suspend fun fetch7DayAgroForecast(
@@ -53,6 +93,53 @@ class OpenMeteoClient(
         .readTimeout(10, TimeUnit.SECONDS)
         .build()
 ) : MeteoForecastDataSource {
+
+    companion object {
+        /**
+         * Maximum age in days for a daily weather observation/forecast record to be considered fresh.
+         */
+        const val WEATHER_FRESHNESS_THRESHOLD_DAYS: Long = 1L
+
+        /**
+         * Maximum age in seconds (6 hours) for an offline cached weather snapshot before it is flagged stale.
+         */
+        const val WEATHER_CACHE_MAX_AGE_SECONDS: Long = 6L * 3600L
+
+        /**
+         * Strictly validates and parses an ISO-8601 date (`YYYY-MM-DD`) or timestamp prefix.
+         * Returns `null` for blank, malformed, or out-of-range strings so invalid timestamps
+         * are never silently treated as fresh.
+         */
+        fun parseValidIsoDateOrNull(rawTimestampIso: String?): LocalDate? {
+            if (rawTimestampIso.isNullOrBlank()) return null
+            val trimmed = rawTimestampIso.trim()
+            if (trimmed.length < 10) return null
+            val datePart = trimmed.take(10)
+            val isoPattern = Regex("""^\d{4}-\d{2}-\d{2}$""")
+            if (!isoPattern.matches(datePart)) return null
+            return try {
+                val parsed = LocalDate.parse(datePart)
+                if (parsed.year !in 2000..2100) null else parsed
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+        /**
+         * Evaluates whether [observationTimestampIso] is valid and within [maxAgeDays] of [referenceDate].
+         * Any invalid, blank, or malformed timestamp is explicitly rejected (`false`).
+         */
+        fun isObservationTimestampFresh(
+            observationTimestampIso: String?,
+            referenceDate: LocalDate = LocalDate.now(),
+            maxAgeDays: Long = WEATHER_FRESHNESS_THRESHOLD_DAYS
+        ): Boolean {
+            val obsDate = parseValidIsoDateOrNull(observationTimestampIso) ?: return false
+            val ageDays = java.time.temporal.ChronoUnit.DAYS.between(obsDate, referenceDate)
+            // Reject dates older than maxAgeDays or unrealistically far in the future (> 7 days forecast horizon)
+            return ageDays in -7L..maxAgeDays
+        }
+    }
 
     @Volatile
     private var lastCachedLiveResult: OpenMeteoResult? = null
@@ -70,7 +157,8 @@ class OpenMeteoClient(
                 isLive = false,
                 httpStatusCode = 400,
                 latencyMs = 0L,
-                errorReasonAr = "إحداثيات جغرافية غير صالحة ($latitude, $longitude)"
+                errorReasonAr = "إحداثيات جغرافية غير صالحة ($latitude, $longitude)",
+                fallbackDataMode = TelemetryDataMode.FALLBACK
             )
         }
 
@@ -103,6 +191,7 @@ class OpenMeteoClient(
                             httpStatusCode = code,
                             latencyMs = elapsed,
                             dataMode = TelemetryDataMode.CACHED,
+                            source = "Open-Meteo FAO-56 (In-Memory Cache)",
                             statusMessageAr = "بيانات مخزنة مؤقتاً (CACHED) — تعذر التحديث الحي من Open-Meteo (HTTP $code)",
                             errorDetailAr = "HTTP $code"
                         )
@@ -114,7 +203,8 @@ class OpenMeteoClient(
                         isLive = false,
                         httpStatusCode = code,
                         latencyMs = elapsed,
-                        errorReasonAr = "استجابة غير ناجحة من خادم Open-Meteo (HTTP $code)"
+                        errorReasonAr = "استجابة غير ناجحة من خادم Open-Meteo (HTTP $code)",
+                        fallbackDataMode = TelemetryDataMode.FALLBACK
                     )
                 }
                 val bodyStr = response.body?.string().orEmpty()
@@ -126,7 +216,8 @@ class OpenMeteoClient(
                         isLive = false,
                         httpStatusCode = code,
                         latencyMs = elapsed,
-                        errorReasonAr = "محتوى فارغ من خادم Open-Meteo"
+                        errorReasonAr = "محتوى فارغ من خادم Open-Meteo",
+                        fallbackDataMode = TelemetryDataMode.FALLBACK
                     )
                 }
                 val parsed = parseOpenMeteoJson(
@@ -149,6 +240,7 @@ class OpenMeteoClient(
                     httpStatusCode = 0,
                     latencyMs = elapsed,
                     dataMode = TelemetryDataMode.CACHED,
+                    source = "Open-Meteo FAO-56 (In-Memory Cache)",
                     statusMessageAr = "بيانات مخزنة مؤقتاً (CACHED) — انقطاع الاتصال بالشبكة (${e.javaClass.simpleName})",
                     errorDetailAr = e.javaClass.simpleName
                 )
@@ -160,7 +252,8 @@ class OpenMeteoClient(
                 isLive = false,
                 httpStatusCode = 0,
                 latencyMs = elapsed,
-                errorReasonAr = "تعذر الاتصال بالشبكة (${e.javaClass.simpleName})"
+                errorReasonAr = "تعذر الاتصال بالشبكة (${e.javaClass.simpleName})",
+                fallbackDataMode = TelemetryDataMode.FALLBACK
             )
         }
     }
@@ -190,8 +283,11 @@ class OpenMeteoClient(
         var cumulativeDeficit = 0f
 
         for (i in 0 until count) {
-            val dateIso = timeArr.optString(i, "")
-            val dayLabel = formatArabicDayName(dateIso, i)
+            val dateIso = timeArr.optString(i, "").trim()
+            val validatedDate = parseValidIsoDateOrNull(dateIso)
+                ?: throw IllegalArgumentException("Invalid or malformed Open-Meteo forecast date timestamp at index $i: '$dateIso'")
+            val canonicalDateIso = validatedDate.toString()
+            val dayLabel = formatArabicDayName(canonicalDateIso, i)
             val tMax = tMaxArr.optDouble(i, 31.0).toFloat().coerceIn(-15f, 58f)
             val tMin = tMinArr.optDouble(i, 18.0).toFloat().coerceIn(-20f, tMax)
             val precip = precipArr.optDouble(i, 0.0).toFloat().coerceIn(0f, 300f)
@@ -226,7 +322,7 @@ class OpenMeteoClient(
 
             rawDays.add(
                 DailyMeteoRecord(
-                    dateIso = dateIso,
+                    dateIso = canonicalDateIso,
                     dayLabelAr = dayLabel,
                     tempMaxC = tMax,
                     tempMinC = tMin,
@@ -253,10 +349,20 @@ class OpenMeteoClient(
             latencyMs = latencyMs,
             lastSuccessfulSyncIso = syncIso,
             dataMode = TelemetryDataMode.LIVE,
-            errorDetailAr = null
+            errorDetailAr = null,
+            source = "Open-Meteo FAO-56 Penman-Monteith API",
+            observationTimestampIso = rawDays.first().dateIso,
+            retrievalTimestampIso = syncIso,
+            units = OpenMeteoResult.DEFAULT_WEATHER_UNITS
         )
     }
 
+    /**
+     * Builds an offline agro-climatic baseline forecast when live Open-Meteo telemetry is unreachable.
+     *
+     * CRITICAL PROVENANCE RULE: Fallback data is NEVER marked `isLiveConnected = true` or `TelemetryDataMode.LIVE`,
+     * even if legacy callers pass `isLive = true`.
+     */
     fun buildFallbackForecast(
         latitude: Double,
         longitude: Double,
@@ -264,7 +370,8 @@ class OpenMeteoClient(
         isLive: Boolean = false,
         httpStatusCode: Int = 0,
         latencyMs: Long = 0L,
-        errorReasonAr: String? = null
+        errorReasonAr: String? = null,
+        fallbackDataMode: TelemetryDataMode = TelemetryDataMode.FALLBACK
     ): OpenMeteoResult {
         val southWarmthOffset = ((31.0 - latitude) * 0.85).toFloat().coerceIn(-1.5f, 7.5f)
         val baseTempsMax = listOf(31.5f, 33.0f, 35.8f, 36.4f, 32.8f, 30.9f, 31.4f)
@@ -311,17 +418,58 @@ class OpenMeteoClient(
             )
         }
 
+        val resolvedMode = if (fallbackDataMode == TelemetryDataMode.LIVE) {
+            TelemetryDataMode.FALLBACK
+        } else {
+            fallbackDataMode
+        }
+        val modePrefix = when (resolvedMode) {
+            TelemetryDataMode.DEMO, TelemetryDataMode.DEMO_ESTIMATED -> "[DEMO / ESTIMATED]"
+            TelemetryDataMode.UNAVAILABLE -> "[UNAVAILABLE]"
+            TelemetryDataMode.CACHED -> "[CACHED]"
+            else -> "[FALLBACK]"
+        }
         val reasonSuffix = if (!errorReasonAr.isNullOrBlank()) " — السبب: $errorReasonAr" else ""
+        val retrievalIso = Instant.now().toString().take(19).replace('T', ' ')
         return OpenMeteoResult(
             records = records,
-            isLiveConnected = isLive,
-            statusMessageAr = "[DEMO / ESTIMATED] وضع تقديري احتياطي (Offline Baseline): نموذج مناخي استرشادي للإحداثيات (${"%.2f".format(Locale.US, latitude)}°N, ${"%.2f".format(Locale.US, longitude)}°E)$reasonSuffix",
+            isLiveConnected = false,
+            statusMessageAr = "$modePrefix وضع تقديري احتياطي (Offline Baseline): نموذج مناخي استرشادي للإحداثيات (${"%.2f".format(Locale.US, latitude)}°N, ${"%.2f".format(Locale.US, longitude)}°E)$reasonSuffix",
             alerts = buildAgroAlerts(records),
-            httpStatusCode = if (isLive) 200 else httpStatusCode,
+            httpStatusCode = httpStatusCode,
             latencyMs = latencyMs,
-            lastSuccessfulSyncIso = LocalDate.now().toString(),
-            dataMode = if (isLive) TelemetryDataMode.LIVE else TelemetryDataMode.DEMO_ESTIMATED,
-            errorDetailAr = errorReasonAr
+            lastSuccessfulSyncIso = today.toString(),
+            dataMode = resolvedMode,
+            errorDetailAr = errorReasonAr,
+            source = if (resolvedMode == TelemetryDataMode.DEMO || resolvedMode == TelemetryDataMode.DEMO_ESTIMATED) {
+                "Demo Agro-Climatic Simulation Fixture"
+            } else {
+                "Offline Agro-Climatic Fallback Baseline"
+            },
+            observationTimestampIso = today.toString(),
+            retrievalTimestampIso = retrievalIso,
+            units = OpenMeteoResult.DEFAULT_WEATHER_UNITS
+        )
+    }
+
+    fun buildUnavailableResult(
+        reasonAr: String = "لا تتوفر بيانات أرصاد حية أو مخزنة حالياً"
+    ): OpenMeteoResult {
+        val retrievalIso = Instant.now().toString().take(19).replace('T', ' ')
+        return OpenMeteoResult(
+            records = emptyList(),
+            isLiveConnected = false,
+            statusMessageAr = "[UNAVAILABLE] $reasonAr",
+            alerts = emptyList(),
+            httpStatusCode = 0,
+            latencyMs = 0L,
+            lastSuccessfulSyncIso = "",
+            dataMode = TelemetryDataMode.UNAVAILABLE,
+            errorDetailAr = reasonAr,
+            source = "UNAVAILABLE",
+            observationTimestampIso = "",
+            retrievalTimestampIso = retrievalIso,
+            units = OpenMeteoResult.DEFAULT_WEATHER_UNITS
         )
     }
 

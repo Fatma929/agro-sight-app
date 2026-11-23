@@ -65,11 +65,22 @@ class ExampleRobolectricTest {
             longitude: Double,
             baseKc: Float
         ): OpenMeteoResult {
-            return OpenMeteoClient().buildFallbackForecast(
+            val baseFallback = OpenMeteoClient().buildFallbackForecast(
                 latitude = latitude,
                 longitude = longitude,
-                baseKc = baseKc,
-                isLive = true
+                baseKc = baseKc
+            )
+            val obsIso = baseFallback.records.firstOrNull()?.dateIso ?: "2026-05-01"
+            return OpenMeteoResult(
+                records = baseFallback.records,
+                alerts = baseFallback.alerts,
+                isLiveConnected = true,
+                dataMode = com.example.data.TelemetryDataMode.LIVE,
+                httpStatusCode = 200,
+                statusMessageAr = "متصل حياً بـ Open-Meteo FAO-56 API ($latitude, $longitude) [HTTP 200]",
+                source = "Open-Meteo FAO-56 Penman-Monteith API (https://api.open-meteo.com/v1/forecast)",
+                observationTimestampIso = obsIso,
+                retrievalTimestampIso = "${obsIso}T10:00:00Z"
             )
         }
     }
@@ -962,14 +973,30 @@ class ExampleRobolectricTest {
                     longitude: Double,
                     baseKc: Float
                 ): OpenMeteoResult {
-                    return OpenMeteoClient().buildFallbackForecast(
+                    val fallback = OpenMeteoClient().buildFallbackForecast(
                         latitude = latitude,
                         longitude = longitude,
                         baseKc = baseKc,
-                        isLive = isNetworkOnline,
+                        isLive = false,
                         httpStatusCode = if (isNetworkOnline) 200 else 0,
                         errorReasonAr = if (isNetworkOnline) null else "Offline Test Disconnect"
                     )
+                    return if (isNetworkOnline) {
+                        val obsIso = fallback.records.firstOrNull()?.dateIso ?: "2026-05-01"
+                        OpenMeteoResult(
+                            records = fallback.records,
+                            alerts = fallback.alerts,
+                            isLiveConnected = true,
+                            dataMode = com.example.data.TelemetryDataMode.LIVE,
+                            httpStatusCode = 200,
+                            statusMessageAr = "متصل حياً بـ Open-Meteo FAO-56 API [HTTP 200]",
+                            source = "Open-Meteo FAO-56 Penman-Monteith API (https://api.open-meteo.com/v1/forecast)",
+                            observationTimestampIso = obsIso,
+                            retrievalTimestampIso = "${obsIso}T10:00:00Z"
+                        )
+                    } else {
+                        fallback
+                    }
                 }
             }
 
@@ -3083,7 +3110,276 @@ finally:
             uiViewModel.uiState.value.currentScreen
         )
     }
+
+    @Test
+    fun `Phase C1 Part 5 and Part 6 enforces Firebase restore-before-sync, multi-UID isolation, offline restore protection, and scientific context provenance`() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        app.getSharedPreferences("agrosight_enterprise_store_v3", Context.MODE_PRIVATE)
+            .edit()
+            .clear()
+            .commit()
+
+        val dbService = DatabaseService(app)
+        var currentAuthenticatedUid: String? = null
+        val cloudWorkspacesByUid = mutableMapOf<String, FarmerCloudWorkspace>()
+        val upsertHistory = mutableListOf<Pair<String, String>>() // (uid, fieldName)
+        var simulateOfflineFetchFailure = false
+
+        // Pre-populate an existing cloud workspace for Alice (Scenarios 2 & 4: Existing user login & existing cloud workspace)
+        cloudWorkspacesByUid["uid_alice_001"] = FarmerCloudWorkspace(
+            userId = "uid_alice_001",
+            role = "FARMER",
+            accountStatus = "ACTIVE",
+            farmerName = "م. أليس cloud",
+            fieldName = "مزرعة أليس السحابية المستعادة",
+            region = "الفيوم",
+            cropType = "قمح (Wheat)",
+            areaFeddans = 85.0,
+            latitude = 29.3084,
+            longitude = 30.8428,
+            soilPh = 7.4,
+            soilEce = 1.9,
+            waterEcw = 1.1,
+            ndviMean = 0.76,
+            ndreMean = 0.41,
+            psriMean = 0.08,
+            ndmiMean = 0.43,
+            detectedRiskName = "نمو خضري متوازن (Healthy Canopy)"
+        )
+
+        val statefulCloudRepo = object : CloudWorkspaceRepository {
+            override val currentUser: FirebaseUser? = null
+
+            override fun observeAuthState(): Flow<FirebaseUser?> = flowOf(null)
+
+            override suspend fun signInWithGoogleIdToken(idToken: String): Result<FirebaseUser> =
+                Result.failure(IllegalStateException("Handled via restoreAndObserveCloudWorkspaceForUser in test"))
+
+            override fun signOut() {
+                currentAuthenticatedUid = null
+            }
+
+            override suspend fun fetchFarmerWorkspace(userId: String): Result<FarmerCloudWorkspace?> {
+                if (simulateOfflineFetchFailure) {
+                    return Result.failure(java.io.IOException("Simulated offline network timeout during cloud restore"))
+                }
+                val ws = cloudWorkspacesByUid[userId]
+                if (ws != null && ws.userId != userId) {
+                    return Result.failure(SecurityException("Cross-user UID mismatch"))
+                }
+                return Result.success(ws)
+            }
+
+            override fun observeWorkspace(userId: String): Flow<FarmerCloudWorkspace?> =
+                flowOf(cloudWorkspacesByUid[userId])
+
+            override fun observeCloudChatLogs(userId: String): Flow<List<CloudChatLog>> =
+                flowOf(emptyList())
+
+            override suspend fun upsertFarmerWorkspace(
+                userId: String,
+                farmerName: String,
+                whatsappPhone: String,
+                gmailAddress: String,
+                nationalId: String,
+                fieldName: String,
+                region: String,
+                cropType: String,
+                areaFeddans: Float,
+                latitude: Double,
+                longitude: Double,
+                soilPh: Float,
+                soilEce: Float,
+                waterEcw: Float,
+                ndviMean: Float,
+                ndreMean: Float,
+                psriMean: Float,
+                ndmiMean: Float,
+                detectedRiskName: String
+            ): Result<Unit> {
+                val activeUid = currentAuthenticatedUid ?: return Result.failure(IllegalStateException("Unauthenticated"))
+                if (activeUid != userId) {
+                    return Result.failure(SecurityException("Cross-user write blocked"))
+                }
+                upsertHistory.add(userId to fieldName)
+                cloudWorkspacesByUid[userId] = FarmerCloudWorkspace(
+                    userId = userId,
+                    farmerName = farmerName,
+                    fieldName = fieldName,
+                    region = region,
+                    cropType = cropType,
+                    areaFeddans = areaFeddans.toDouble(),
+                    latitude = latitude,
+                    longitude = longitude,
+                    soilPh = soilPh.toDouble(),
+                    soilEce = soilEce.toDouble(),
+                    waterEcw = waterEcw.toDouble(),
+                    ndviMean = ndviMean.toDouble(),
+                    ndreMean = ndreMean.toDouble(),
+                    psriMean = psriMean.toDouble(),
+                    ndmiMean = ndmiMean.toDouble(),
+                    detectedRiskName = detectedRiskName
+                )
+                return Result.success(Unit)
+            }
+
+            override suspend fun adminUpdateCloudUserRoleAndStatus(
+                targetUserId: String,
+                newRole: String,
+                newStatus: String
+            ): Result<Unit> = Result.success(Unit)
+
+            override suspend fun appendCloudChatLog(
+                userId: String,
+                role: String,
+                channel: String,
+                messageText: String,
+                groundingSources: String
+            ): Result<Unit> = Result.success(Unit)
+
+            override suspend fun deleteCloudWorkspace(userId: String): Result<Unit> = Result.success(Unit)
+        }
+
+        val viewModel = AgroSightViewModel(
+            app,
+            AgroSightDependencies(
+                databaseService = dbService,
+                openMeteoClient = FakeMeteoDataSource(),
+                openSourceSatelliteClient = FakeSatelliteDataSource(),
+                satelliteRasterBackendRepository = FakeSatelliteRasterBackendRepository(),
+                geminiAgroService = FakeAiCopilotDataSource(),
+                cloudWorker = AgroSightCloudWorker(dbService, FakeAiCopilotDataSource()),
+                firestoreRepository = statefulCloudRepo,
+                sqlAuditDao = FakeSqlFieldAuditDao()
+            )
+        )
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+        // 1. Existing user Alice signs in -> MUST restore existing cloud workspace FIRST and NEVER overwrite it with local default data
+        currentAuthenticatedUid = "uid_alice_001"
+        kotlinx.coroutines.runBlocking {
+            viewModel.restoreAndObserveCloudWorkspaceForUser(
+                uid = "uid_alice_001",
+                email = "alice.farmer@gmail.com",
+                displayName = "م. أليس cloud"
+            )
+        }
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+        val aliceState = viewModel.uiState.value
+        assertEquals("uid_alice_001", aliceState.firebaseUserUid)
+        assertTrue(aliceState.isCloudWorkspaceRestored)
+        assertEquals("uid_alice_001", aliceState.restoredCloudWorkspaceUid)
+        assertEquals(null, aliceState.cloudRestoreErrorAr)
+        assertEquals(
+            "Existing cloud workspace must be restored instead of being overwritten by local default field",
+            "مزرعة أليس السحابية المستعادة",
+            aliceState.fieldName
+        )
+        assertEquals(85f, aliceState.areaFeddans, 0.01f)
+        assertEquals("قمح (Wheat)", aliceState.selectedCrop.nameAr)
+        assertFalse(
+            "No local-to-cloud upsert may overwrite Alice's existing cloud workspace during login restore",
+            upsertHistory.any { it.first == "uid_alice_001" && it.second != "مزرعة أليس السحابية المستعادة" }
+        )
+
+        // 2. Switch accounts to brand-new farmer Bob (Scenarios 1, 3, 7, 8: First login, empty cloud workspace, switching accounts, two different UIDs)
+        currentAuthenticatedUid = "uid_bob_002"
+        kotlinx.coroutines.runBlocking {
+            viewModel.restoreAndObserveCloudWorkspaceForUser(
+                uid = "uid_bob_002",
+                email = "bob.new@gmail.com",
+                displayName = "م. بوب الجديد"
+            )
+        }
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+        val bobState = viewModel.uiState.value
+        assertEquals("uid_bob_002", bobState.firebaseUserUid)
+        assertTrue(bobState.isCloudWorkspaceRestored)
+        assertFalse(bobState.activeFarmer.isDemoAccount)
+        assertTrue(
+            "Bob must be isolated in his own local farmer record (not sharing Alice's record)",
+            bobState.activeFarmer.id.contains("uid_bob_002")
+        )
+        assertTrue(
+            "Bob's field must not contain Alice's cloud field name",
+            bobState.fieldName != "مزرعة أليس السحابية المستعادة"
+        )
+        val bobInitialCloudWorkspace = cloudWorkspacesByUid["uid_bob_002"]
+        assertNotNull("Initial cloud workspace must be created for new user Bob after empty cloud check", bobInitialCloudWorkspace)
+        assertEquals("New real user Bob's cloud workspace must have 0.0 NDVI (no fabricated demo scan)", 0.0, bobInitialCloudWorkspace!!.ndviMean, 1e-6)
+        assertEquals("Alice's cloud workspace must remain untouched when Bob signs in", "مزرعة أليس السحابية المستعادة", cloudWorkspacesByUid["uid_alice_001"]?.fieldName)
+
+        // 3. Offline / interrupted cloud restoration (Scenarios 5 & 6)
+        cloudWorkspacesByUid["uid_charlie_003"] = FarmerCloudWorkspace(
+            userId = "uid_charlie_003",
+            farmerName = "م. تشارلي",
+            fieldName = "مزرعة تشارلي المحمية من الكتابة فوقها",
+            areaFeddans = 120.0
+        )
+        simulateOfflineFetchFailure = true
+        currentAuthenticatedUid = "uid_charlie_003"
+        kotlinx.coroutines.runBlocking {
+            viewModel.restoreAndObserveCloudWorkspaceForUser(
+                uid = "uid_charlie_003",
+                email = "charlie@gmail.com",
+                displayName = "م. تشارلي"
+            )
+        }
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+        val charlieOfflineState = viewModel.uiState.value
+        assertEquals("uid_charlie_003", charlieOfflineState.firebaseUserUid)
+        assertFalse(
+            "When cloud fetch fails offline, isCloudWorkspaceRestored must remain false to block destructive local-to-cloud overwrite",
+            charlieOfflineState.isCloudWorkspaceRestored
+        )
+        assertNotNull(charlieOfflineState.cloudRestoreErrorAr)
+        // Attempting to sync while restoration is pending must NOT overwrite Charlie's cloud workspace
+        viewModel.syncCurrentWorkspaceToFirestore()
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+        assertEquals(
+            "Offline login must never overwrite existing cloud workspace before restoration succeeds",
+            "مزرعة تشارلي المحمية من الكتابة فوقها",
+            cloudWorkspacesByUid["uid_charlie_003"]?.fieldName
+        )
+
+        // Now network recovers and Charlie retries restoration -> cloud workspace is restored cleanly
+        simulateOfflineFetchFailure = false
+        viewModel.retryCloudWorkspaceRestore()
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+        assertTrue(viewModel.uiState.value.isCloudWorkspaceRestored)
+        assertEquals("مزرعة تشارلي المحمية من الكتابة فوقها", viewModel.uiState.value.fieldName)
+        assertEquals(120f, viewModel.uiState.value.areaFeddans, 0.01f)
+
+        // 4. Part 6: Verify AgriculturalContextProvider & GeminiAgroService scientific data provenance
+        val bobContext = com.example.data.AgriculturalContextProvider.buildContext(
+            uiState = bobState,
+            currentQuery = "هل المحصول عندي بحالة جيدة؟"
+        )
+        assertEquals(
+            "Unscanned real farmer account must have MISSING satellite ScientificDataStatus",
+            com.example.data.ScientificDataStatus.MISSING,
+            bobContext.satellite.dataStatus
+        )
+        assertFalse(
+            "Unscanned real farmer account must never claim isLiveSentinel2Observation",
+            bobContext.satellite.isLiveSentinel2Observation
+        )
+        val realGemini = com.example.data.GeminiAgroService()
+        val replyForUnscannedBob = realGemini.buildContextAwareAgronomyReply(
+            farmerQuestion = "هل المحصول عندي بحالة جيدة؟",
+            context = bobContext,
+            responseMode = com.example.data.AssistantResponseMode.TECHNICAL
+        )
+        assertTrue(
+            "Assistant reply for unscanned real farmer must explicitly state satellite data is MISSING",
+            replyForUnscannedBob.contains("غير متوفر") && replyForUnscannedBob.contains("MISSING")
+        )
+    }
 }
+
 
 
 

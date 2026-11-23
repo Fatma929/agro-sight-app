@@ -54,6 +54,7 @@ import com.example.data.buildFarmBoundaryGeoJsonPolygon
 import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.sync.withLock
 import com.example.model.AccountStatus
 import com.example.model.AgroClimaticAlert
 import com.example.model.AppScreen
@@ -131,8 +132,13 @@ data class AgroSightUiState(
     val valveFlowRateM3PerFeddanHr: Float = 16.0f,
     // 5. Meteorology & Open-Meteo FAO-56
     val isLoadingMeteo: Boolean = false,
-    val isLiveMeteoConnected: Boolean = true,
-    val meteoStatusAr: String = "بث حي للأرصاد Open-Meteo FAO-56",
+    val isLiveMeteoConnected: Boolean = false,
+    val meteoStatusAr: String = "[FALLBACK] وضع تقديري احتياطي (Offline Baseline)",
+    val meteoDataMode: TelemetryDataMode = TelemetryDataMode.FALLBACK,
+    val meteoSource: String = "Offline Agro-Climatic Fallback Baseline",
+    val meteoObservationTimestampIso: String = "",
+    val meteoRetrievalTimestampIso: String = "",
+    val meteoUnits: Map<String, String> = com.example.data.OpenMeteoResult.DEFAULT_WEATHER_UNITS,
     val forecastDays: List<DailyMeteoRecord> = emptyList(),
     val selectedForecastDayIndex: Int = 0,
     val climaticAlerts: List<AgroClimaticAlert> = emptyList(),
@@ -185,6 +191,9 @@ data class AgroSightUiState(
     val firebaseUserEmail: String? = null,
     val firebaseUserDisplayName: String? = null,
     val isFirebaseSyncing: Boolean = false,
+    val isCloudWorkspaceRestored: Boolean = false,
+    val restoredCloudWorkspaceUid: String? = null,
+    val cloudRestoreErrorAr: String? = null,
     val firebaseCloudStatusAr: String = "غير متصل بحساب Google السحابي (متاح المزامنة الفورية مع Firestore)",
     val cloudWorkspace: FarmerCloudWorkspace? = null,
     val cloudChatLogs: List<CloudChatLog> = emptyList(),
@@ -241,6 +250,11 @@ class AgroSightViewModel(
     private var geoTiffDownloadJob: Job? = null
     private var firestoreWorkspaceJob: Job? = null
     private var firestoreChatLogsJob: Job? = null
+    private val cloudSyncMutex = kotlinx.coroutines.sync.Mutex()
+    @Volatile
+    private var restoredCloudWorkspaceForUid: String? = null
+    @Volatile
+    private var isCloudRestoreInProgress: Boolean = false
 
     private val _uiState: MutableStateFlow<AgroSightUiState>
     val uiState: StateFlow<AgroSightUiState>
@@ -250,7 +264,8 @@ class AgroSightViewModel(
         val initFarmer = initSnap.farmers.find { it.id == initSnap.activeFarmerId } ?: initSnap.farmers.first()
         val initField = initSnap.fields.find { it.farmerId == initFarmer.id } ?: initSnap.fields.first()
         val initSoil = initSnap.soilProfiles.find { it.fieldId == initField.id } ?: initSnap.soilProfiles.first()
-        val initScan = initSnap.satelliteSpectralScans.find { it.fieldId == initField.id } ?: initSnap.satelliteSpectralScans.first()
+        val initScan = initSnap.satelliteSpectralScans.find { it.fieldId == initField.id }
+            ?: if (initFarmer.isDemoAccount) initSnap.satelliteSpectralScans.firstOrNull() else null
 
         val cropSpec = SUPPORTED_CROPS.find { it.nameAr == initField.cropType } ?: SUPPORTED_CROPS.first()
         val growth = evaluateCropGrowthStage(cropSpec, 68)
@@ -261,6 +276,7 @@ class AgroSightViewModel(
         )
         val todayRec = fallbackMeteo.records.first()
 
+        val initAnomalyPattern = initScan?.anomalyPattern ?: AnomalyPattern.HEALTHY
         val initEpiReport = SatelliteEpidemiologyEngine.evaluateFieldEpidemiology(
             fieldId = initField.id,
             cropNameAr = cropSpec.nameAr,
@@ -270,7 +286,7 @@ class AgroSightViewModel(
             tempMaxC = todayRec.tempMaxC,
             relativeHumidityPct = todayRec.relativeHumidityPct,
             windSpeedKmh = todayRec.windSpeedKmh,
-            selectedPattern = initScan.anomalyPattern
+            selectedPattern = initAnomalyPattern
         )
 
         val initSimInput = WhatIfSimulatorInput(
@@ -317,6 +333,13 @@ class AgroSightViewModel(
             soilPh = initSoil.soilPh,
             soilEce = initSoil.soilEc,
             waterEcw = initSoil.waterEc,
+            isLiveMeteoConnected = fallbackMeteo.isLiveConnected,
+            meteoStatusAr = fallbackMeteo.statusMessageAr,
+            meteoDataMode = fallbackMeteo.dataMode,
+            meteoSource = fallbackMeteo.source,
+            meteoObservationTimestampIso = fallbackMeteo.observationTimestampIso,
+            meteoRetrievalTimestampIso = fallbackMeteo.retrievalTimestampIso,
+            meteoUnits = fallbackMeteo.units,
             forecastDays = fallbackMeteo.records,
             climaticAlerts = fallbackMeteo.alerts,
             whatIfInput = initSimInput,
@@ -333,7 +356,7 @@ class AgroSightViewModel(
                 valveFlowRateM3PerFeddanHr = initField.flowRateM3Hr,
                 simInput = initSimInput
             ),
-            activeAnomalyPattern = initScan.anomalyPattern,
+            activeAnomalyPattern = initAnomalyPattern,
             epidemiologyReport = initEpiReport,
             formulaAudit = initFormulaAudit,
             geminiChatMessages = listOf(
@@ -507,7 +530,8 @@ class AgroSightViewModel(
         val farmer = snap.farmers.find { it.id == snap.activeFarmerId } ?: snap.farmers.first()
         val field = snap.fields.find { it.farmerId == farmer.id } ?: snap.fields.first()
         val soil = snap.soilProfiles.find { it.fieldId == field.id } ?: snap.soilProfiles.first()
-        val scan = snap.satelliteSpectralScans.find { it.fieldId == field.id } ?: snap.satelliteSpectralScans.first()
+        val scan = snap.satelliteSpectralScans.find { it.fieldId == field.id }
+            ?: if (farmer.isDemoAccount) snap.satelliteSpectralScans.firstOrNull() else null
 
         val cropSpec = SUPPORTED_CROPS.find { it.nameAr == field.cropType } ?: SUPPORTED_CROPS.first()
         val texture = SoilTexture.entries.find { field.irrigationType.contains(it.nameAr.take(4)) }
@@ -530,6 +554,8 @@ class AgroSightViewModel(
         val zonePreset = EGYPTIAN_ZONE_PRESETS.find { it.nameAr == farmer.region }
 
         _uiState.update { state ->
+            val clearForeignRaster = state.rasterBackendResult?.takeIf { it.farmId == field.id }
+            val clearForeignTelemetry = if (state.fieldId == field.id) state.satelliteAndNasaTelemetry else null
             recalculateDerivedState(
                 state.copy(
                     dbSnapshot = snap,
@@ -549,7 +575,9 @@ class AgroSightViewModel(
                     waterEcw = soil.waterEc,
                     irrigationSystem = irrigSys,
                     valveFlowRateM3PerFeddanHr = field.flowRateM3Hr,
-                    activeAnomalyPattern = scan.anomalyPattern,
+                    activeAnomalyPattern = scan?.anomalyPattern ?: AnomalyPattern.HEALTHY,
+                    rasterBackendResult = clearForeignRaster,
+                    satelliteAndNasaTelemetry = clearForeignTelemetry,
                     geminiEpidemiologyAnalysisText = ""
                 )
             )
@@ -1310,6 +1338,11 @@ class AgroSightViewModel(
                         current.copy(
                             isLiveMeteoConnected = effectiveMeteoResult.isLiveConnected,
                             meteoStatusAr = effectiveMeteoResult.statusMessageAr,
+                            meteoDataMode = effectiveMeteoResult.dataMode,
+                            meteoSource = effectiveMeteoResult.source,
+                            meteoObservationTimestampIso = effectiveMeteoResult.observationTimestampIso,
+                            meteoRetrievalTimestampIso = effectiveMeteoResult.retrievalTimestampIso,
+                            meteoUnits = effectiveMeteoResult.units,
                             forecastDays = effectiveMeteoResult.records,
                             climaticAlerts = effectiveMeteoResult.alerts,
                             satelliteAndNasaTelemetry = effectiveSatAndNasa,
@@ -1697,24 +1730,69 @@ class AgroSightViewModel(
             databaseService = databaseService
         )
         val rasterRes = state.rasterBackendResult
-        val mergedEpiReport = if (rasterRes != null && rasterRes.farmId == state.fieldId && rasterRes.pixelGrid.isNotEmpty()) {
-            derived.epidemiologyReport.copy(
-                ndviMean = rasterRes.ndviMean,
-                ndreMean = rasterRes.ndreMean,
-                ndmiMean = rasterRes.ndmiMean,
-                psriMean = rasterRes.psriMean,
-                pixelGrid = rasterRes.pixelGrid,
-                vegetationStressDetectionAr = rasterRes.vegetationStressDetectionAr,
-                agriculturalRiskAssessmentAr = rasterRes.agriculturalRiskAssessmentAr,
-                confirmedDiseaseDiagnosisStatusAr = rasterRes.confirmedDiseaseDiagnosisStatusAr,
-                dataModeDesignation = if (rasterRes.isLiveGeoreferencedRaster) {
-                    "LIVE_GEOREFERENCED_RASTER (EPSG:${rasterRes.crsEpsg} • ${rasterRes.spatialResolutionMeters.toInt()}m)"
-                } else {
-                    rasterRes.executionState.badgeAr
-                }
-            )
-        } else {
-            derived.epidemiologyReport
+        val recordedScanForField = state.dbSnapshot.satelliteSpectralScans.find { it.fieldId == state.fieldId }
+        val hasLiveRasterForField = rasterRes != null && rasterRes.farmId == state.fieldId && rasterRes.pixelGrid.isNotEmpty()
+
+        val mergedEpiReport = when {
+            hasLiveRasterForField && rasterRes != null -> {
+                derived.epidemiologyReport.copy(
+                    ndviMean = rasterRes.ndviMean,
+                    ndreMean = rasterRes.ndreMean,
+                    ndmiMean = rasterRes.ndmiMean,
+                    psriMean = rasterRes.psriMean,
+                    pixelGrid = rasterRes.pixelGrid,
+                    vegetationStressDetectionAr = rasterRes.vegetationStressDetectionAr,
+                    agriculturalRiskAssessmentAr = rasterRes.agriculturalRiskAssessmentAr,
+                    confirmedDiseaseDiagnosisStatusAr = rasterRes.confirmedDiseaseDiagnosisStatusAr,
+                    dataModeDesignation = if (rasterRes.isLiveGeoreferencedRaster) {
+                        "LIVE_GEOREFERENCED_RASTER (EPSG:${rasterRes.crsEpsg} • ${rasterRes.spatialResolutionMeters.toInt()}m)"
+                    } else {
+                        rasterRes.executionState.badgeAr
+                    }
+                )
+            }
+            recordedScanForField != null -> {
+                derived.epidemiologyReport.copy(
+                    ndviMean = recordedScanForField.ndviMean,
+                    ndreMean = recordedScanForField.ndreMean,
+                    ndmiMean = recordedScanForField.ndmiMean,
+                    psriMean = recordedScanForField.psriMean,
+                    infectedAreaFeddans = recordedScanForField.infectedAreaFeddans,
+                    hotspotLocationAr = recordedScanForField.hotspotCoordinates.ifBlank { derived.epidemiologyReport.hotspotLocationAr },
+                    detectedRiskNameAr = recordedScanForField.detectedRiskName.ifBlank { derived.epidemiologyReport.detectedRiskNameAr },
+                    confidenceScorePct = recordedScanForField.confidenceScore
+                )
+            }
+            !state.activeFarmer.isDemoAccount -> {
+                // Real farmer account with no satellite scan recorded yet:
+                // Never fabricate NDVI/NDRE/NDMI/PSRI values, fake disease alerts, or fake pesticide prescriptions.
+                derived.epidemiologyReport.copy(
+                    anomalyPattern = AnomalyPattern.HEALTHY,
+                    caseTitleAr = "في انتظار إجراء أول مسح طيفي بالقمر الصناعي للحقل",
+                    isBiologicalDisease = false,
+                    ndviMean = 0f,
+                    ndreMean = 0f,
+                    psriMean = 0f,
+                    ndmiMean = 0f,
+                    infectedAreaFeddans = 0f,
+                    hotspotLocationAr = "غير محدد (لم يتم إجراء مسح طيفي بعد)",
+                    detectedRiskNameAr = "لم يتم إجراء مسح طيفي بالقمر الصناعي لهذا الحقل بعد",
+                    vegetationStressDetectionAr = "لا يتوفر مسح طيفي مسجل لهذا الحقل حتى الآن",
+                    agriculturalRiskAssessmentAr = "في انتظار إجراء أول مسح طيفي عبر Sentinel-2 لتقييم حالة المحصول",
+                    confirmedDiseaseDiagnosisStatusAr = "لا يوجد رصد طيفي أو تشخيص مرضي مسجل",
+                    supportingObservationsAr = emptyList(),
+                    possibleCausesAr = emptyList(),
+                    recommendedFieldInspectionAr = "تشغيل المسح الطيفي للحقل عبر رادار Sentinel-2 أو إجراء الفحص الميداني الروتيني.",
+                    uncertaintyAndLimitationsAr = "لا توجد بيانات طيفية مسجلة لهذا الحقل حالياً؛ المنصة لا تخترع قراءات غير مسجلة.",
+                    confidenceScorePct = 0,
+                    valveAdjustmentPercent = 0,
+                    immediateIrrigationActionAr = "استمرار جدولة الري الإرشادية حسب FAO-56 حتى توفر مسح طيفي للحقل.",
+                    targetedPreventiveActionAr = "يرجى تشغيل المسح الطيفي للحقل أو إجراء المعاينة الميدانية الروتينية (بدون أي توصيات علاجية أو مبيدات).",
+                    pixelGrid = emptyList(),
+                    dataModeDesignation = "UNAVAILABLE_NO_SCAN"
+                )
+            }
+            else -> derived.epidemiologyReport
         }
 
         return state.copy(
@@ -1893,60 +1971,214 @@ class AgroSightViewModel(
                     if (e is CancellationException) throw e
                 }
                 .collect { user ->
-                firestoreWorkspaceJob?.cancel()
-                firestoreChatLogsJob?.cancel()
+                    firestoreWorkspaceJob?.cancel()
+                    firestoreChatLogsJob?.cancel()
 
-                if (user == null) {
-                    _uiState.update {
-                        it.copy(
-                            firebaseUserUid = null,
-                            firebaseUserEmail = null,
-                            firebaseUserDisplayName = null,
-                            cloudWorkspace = null,
-                            cloudChatLogs = emptyList(),
-                            firebaseCloudStatusAr = "غير متصل بحساب Google السحابي (اضغط لتسجيل الدخول عبر Google)"
+                    if (user == null || user.uid.isBlank()) {
+                        restoredCloudWorkspaceForUid = null
+                        isCloudRestoreInProgress = false
+                        _uiState.update {
+                            it.copy(
+                                firebaseUserUid = null,
+                                firebaseUserEmail = null,
+                                firebaseUserDisplayName = null,
+                                isCloudWorkspaceRestored = false,
+                                restoredCloudWorkspaceUid = null,
+                                cloudRestoreErrorAr = null,
+                                cloudWorkspace = null,
+                                cloudChatLogs = emptyList(),
+                                firebaseCloudStatusAr = "غير متصل بحساب Google السحابي (اضغط لتسجيل الدخول عبر Google)"
+                            )
+                        }
+                    } else {
+                        restoreAndObserveCloudWorkspaceForUser(
+                            uid = user.uid,
+                            email = user.email,
+                            displayName = user.displayName
                         )
-                    }
-                } else {
-                    _uiState.update {
-                        it.copy(
-                            firebaseUserUid = user.uid,
-                            firebaseUserEmail = user.email ?: it.activeFarmer.gmailAddress,
-                            firebaseUserDisplayName = user.displayName ?: it.activeFarmer.fullName,
-                            firebaseCloudStatusAr = "متصل بالسحابة Firebase Firestore (${user.email ?: user.uid.take(8)}) ✅"
-                        )
-                    }
-                    syncCurrentWorkspaceToFirestore()
-
-                    firestoreWorkspaceJob = viewModelScope.launch {
-                        firestoreRepository.observeWorkspace(user.uid)
-                            .catch { e ->
-                                val fsErr = generateSequence(e) { it.cause }
-                                    .filterIsInstance<FirebaseFirestoreException>()
-                                    .firstOrNull()
-                                if (fsErr == null && e is CancellationException) throw e
-                            }
-                            .collect { ws ->
-                                if (ws != null) {
-                                    _uiState.update { it.copy(cloudWorkspace = ws) }
-                                }
-                            }
-                    }
-
-                    firestoreChatLogsJob = viewModelScope.launch {
-                        firestoreRepository.observeCloudChatLogs(user.uid)
-                            .catch { e ->
-                                val fsErr = generateSequence(e) { it.cause }
-                                    .filterIsInstance<FirebaseFirestoreException>()
-                                    .firstOrNull()
-                                if (fsErr == null && e is CancellationException) throw e
-                            }
-                            .collect { logs ->
-                                _uiState.update { it.copy(cloudChatLogs = logs) }
-                            }
                     }
                 }
+        }
+    }
+
+    /**
+     * Enforces the strict 7-step Restore-Before-Sync ordering for Firebase Authentication & Firestore:
+     * 1. Authenticate current user & validate non-blank UID.
+     * 2. Block local-to-cloud sync until initial restoration for [uid] completes.
+     * 3. Fetch user's cloud workspace from Firestore (`fetchFarmerWorkspace(uid)`).
+     * 4. Validate workspace ownership (`workspace.userId == uid`).
+     * 5. Restore or merge existing cloud data into an isolated local tenant for [uid] without overwriting cloud state.
+     * 6. Mark initial restoration complete for [uid].
+     * 7. Only then allow synchronization from local storage to Firestore (initializing empty cloud workspace on first login).
+     */
+    internal suspend fun restoreAndObserveCloudWorkspaceForUser(
+        uid: String,
+        email: String?,
+        displayName: String?
+    ) {
+        val cleanUid = uid.trim()
+        if (cleanUid.isBlank()) return
+
+        firestoreWorkspaceJob?.cancel()
+        firestoreChatLogsJob?.cancel()
+
+        cloudSyncMutex.withLock {
+            isCloudRestoreInProgress = true
+            restoredCloudWorkspaceForUid = null
+            _uiState.update {
+                it.copy(
+                    isFirebaseSyncing = true,
+                    firebaseUserUid = cleanUid,
+                    firebaseUserEmail = email ?: it.activeFarmer.gmailAddress,
+                    firebaseUserDisplayName = displayName ?: it.activeFarmer.fullName,
+                    isCloudWorkspaceRestored = false,
+                    restoredCloudWorkspaceUid = null,
+                    cloudRestoreErrorAr = null,
+                    cloudWorkspace = null,
+                    cloudChatLogs = emptyList(),
+                    firebaseCloudStatusAr = "جاري استعادة مساحة العمل السحابية من Firestore (${email ?: cleanUid.take(8)})..."
+                )
             }
+
+            try {
+                val fetchRes = firestoreRepository.fetchFarmerWorkspace(cleanUid)
+                if (fetchRes.isSuccess) {
+                    val existingWs = fetchRes.getOrNull()
+                    if (existingWs != null) {
+                        if (existingWs.userId.isNotBlank() && existingWs.userId != cleanUid) {
+                            restoredCloudWorkspaceForUid = null
+                            isCloudRestoreInProgress = false
+                            _uiState.update {
+                                it.copy(
+                                    isFirebaseSyncing = false,
+                                    isCloudWorkspaceRestored = false,
+                                    restoredCloudWorkspaceUid = null,
+                                    cloudRestoreErrorAr = "خطأ أمان: تعارض ملكية مساحة العمل السحابية (${existingWs.userId} != $cleanUid)",
+                                    firebaseCloudStatusAr = "⛔ تم رفض استعادة مساحة العمل بسبب تعارض ملكية الحساب السحابي"
+                                )
+                            }
+                            return
+                        }
+                        val mergedSnap = databaseService.restoreOrMergeCloudFarmerWorkspace(
+                            authenticatedUid = cleanUid,
+                            workspace = existingWs
+                        )
+                        applyTenantSnapshotToUiState(mergedSnap)
+                        restoredCloudWorkspaceForUid = cleanUid
+                        isCloudRestoreInProgress = false
+                        _uiState.update {
+                            it.copy(
+                                isFirebaseSyncing = false,
+                                cloudWorkspace = existingWs.copy(userId = cleanUid),
+                                isCloudWorkspaceRestored = true,
+                                restoredCloudWorkspaceUid = cleanUid,
+                                cloudRestoreErrorAr = null,
+                                firebaseCloudStatusAr = "تم استعادة مساحة العمل السحابية من Firestore (${email ?: cleanUid.take(8)}) ✅"
+                            )
+                        }
+                    } else {
+                        // First login / empty cloud workspace: isolate local tenant for cleanUid, mark restore complete, then sync initial workspace
+                        val isolatedSnap = databaseService.ensureIsolatedLocalTenantForCloudUid(
+                            authenticatedUid = cleanUid,
+                            displayName = displayName,
+                            email = email
+                        )
+                        applyTenantSnapshotToUiState(isolatedSnap)
+                        restoredCloudWorkspaceForUid = cleanUid
+                        isCloudRestoreInProgress = false
+                        _uiState.update {
+                            it.copy(
+                                isFirebaseSyncing = false,
+                                cloudWorkspace = null,
+                                isCloudWorkspaceRestored = true,
+                                restoredCloudWorkspaceUid = cleanUid,
+                                cloudRestoreErrorAr = null
+                            )
+                        }
+                        performValidatedWorkspaceUpsertLocked(cleanUid)
+                    }
+                } else {
+                    // Offline login or interrupted restoration: isolate local tenant safely and block cloud overwrite
+                    val err = fetchRes.exceptionOrNull()
+                    val isolatedSnap = databaseService.ensureIsolatedLocalTenantForCloudUid(
+                        authenticatedUid = cleanUid,
+                        displayName = displayName,
+                        email = email
+                    )
+                    applyTenantSnapshotToUiState(isolatedSnap)
+                    restoredCloudWorkspaceForUid = null
+                    isCloudRestoreInProgress = false
+                    _uiState.update {
+                        it.copy(
+                            isFirebaseSyncing = false,
+                            isCloudWorkspaceRestored = false,
+                            restoredCloudWorkspaceUid = null,
+                            cloudRestoreErrorAr = err?.message ?: "تعذر استعادة مساحة العمل السحابية",
+                            firebaseCloudStatusAr = "وضع عدم الاتصال السحابي: تعذر استعادة مساحة العمل من Firestore — تم الحفاظ على البيانات المحلية دون الكتابة فوق السحابة"
+                        )
+                    }
+                }
+            } catch (e: CancellationException) {
+                isCloudRestoreInProgress = false
+                throw e
+            } catch (e: Exception) {
+                isCloudRestoreInProgress = false
+                restoredCloudWorkspaceForUid = null
+                _uiState.update {
+                    it.copy(
+                        isFirebaseSyncing = false,
+                        isCloudWorkspaceRestored = false,
+                        restoredCloudWorkspaceUid = null,
+                        cloudRestoreErrorAr = e.message ?: "خطأ استعادة السحابة"
+                    )
+                }
+            }
+        }
+
+        firestoreWorkspaceJob = viewModelScope.launch {
+            firestoreRepository.observeWorkspace(cleanUid)
+                .catch { e ->
+                    val fsErr = generateSequence(e) { it.cause }
+                        .filterIsInstance<FirebaseFirestoreException>()
+                        .firstOrNull()
+                    if (fsErr == null && e is CancellationException) throw e
+                }
+                .collect { ws ->
+                    if (ws != null && _uiState.value.firebaseUserUid == cleanUid) {
+                        if (ws.userId.isBlank() || ws.userId == cleanUid) {
+                            val mergedSnap = databaseService.restoreOrMergeCloudFarmerWorkspace(
+                                authenticatedUid = cleanUid,
+                                workspace = ws
+                            )
+                            applyTenantSnapshotToUiState(mergedSnap)
+                            restoredCloudWorkspaceForUid = cleanUid
+                            _uiState.update {
+                                it.copy(
+                                    cloudWorkspace = ws.copy(userId = cleanUid),
+                                    isCloudWorkspaceRestored = true,
+                                    restoredCloudWorkspaceUid = cleanUid,
+                                    cloudRestoreErrorAr = null
+                                )
+                            }
+                        }
+                    }
+                }
+        }
+
+        firestoreChatLogsJob = viewModelScope.launch {
+            firestoreRepository.observeCloudChatLogs(cleanUid)
+                .catch { e ->
+                    val fsErr = generateSequence(e) { it.cause }
+                        .filterIsInstance<FirebaseFirestoreException>()
+                        .firstOrNull()
+                    if (fsErr == null && e is CancellationException) throw e
+                }
+                .collect { logs ->
+                    if (_uiState.value.firebaseUserUid == cleanUid) {
+                        val validLogs = logs.filter { it.userId.isBlank() || it.userId == cleanUid }
+                        _uiState.update { it.copy(cloudChatLogs = validLogs) }
+                    }
+                }
         }
     }
 
@@ -2085,6 +2317,11 @@ class AgroSightViewModel(
                         current.copy(
                             isLiveMeteoConnected = false,
                             meteoStatusAr = restoredMeteo?.statusMessageAr ?: current.meteoStatusAr,
+                            meteoDataMode = TelemetryDataMode.CACHED,
+                            meteoSource = restoredMeteo?.source ?: "Room SQLite Offline Weather Cache",
+                            meteoObservationTimestampIso = restoredMeteo?.observationTimestampIso ?: current.meteoObservationTimestampIso,
+                            meteoRetrievalTimestampIso = syncTime,
+                            meteoUnits = restoredMeteo?.units ?: current.meteoUnits,
                             forecastDays = restoredMeteo?.records?.takeIf { it.isNotEmpty() } ?: current.forecastDays,
                             climaticAlerts = restoredMeteo?.alerts?.takeIf { it.isNotEmpty() } ?: current.climaticAlerts,
                             satelliteAndNasaTelemetry = restoredSat ?: current.satelliteAndNasaTelemetry,
@@ -2179,17 +2416,16 @@ class AgroSightViewModel(
         viewModelScope.launch {
             val result = firestoreRepository.signInWithGoogleIdToken(idToken)
             result.onSuccess { user ->
+                restoreAndObserveCloudWorkspaceForUser(
+                    uid = user.uid,
+                    email = user.email,
+                    displayName = user.displayName
+                )
                 _uiState.update {
                     it.copy(
-                        isFirebaseSyncing = false,
-                        firebaseUserUid = user.uid,
-                        firebaseUserEmail = user.email,
-                        firebaseUserDisplayName = user.displayName,
-                        firebaseCloudStatusAr = "تم تسجيل الدخول بحساب Google (${user.email ?: user.displayName}) ومزامنة Firestore ✅",
                         lastWhatsAppBannerNotificationAr = "تم ربط حساب Google (${user.email ?: ""}) مع قاعدة بيانات Firebase Firestore بنجاح"
                     )
                 }
-                syncCurrentWorkspaceToFirestore()
             }.onFailure { err ->
                 _uiState.update {
                     it.copy(
@@ -2213,12 +2449,17 @@ class AgroSightViewModel(
     fun signOutFirebaseCloud() {
         firestoreWorkspaceJob?.cancel()
         firestoreChatLogsJob?.cancel()
+        restoredCloudWorkspaceForUid = null
+        isCloudRestoreInProgress = false
         firestoreRepository.signOut()
         _uiState.update {
             it.copy(
                 firebaseUserUid = null,
                 firebaseUserEmail = null,
                 firebaseUserDisplayName = null,
+                isCloudWorkspaceRestored = false,
+                restoredCloudWorkspaceUid = null,
+                cloudRestoreErrorAr = null,
                 cloudWorkspace = null,
                 cloudChatLogs = emptyList(),
                 firebaseCloudStatusAr = "تم تسجيل الخروج من سحابة Firebase"
@@ -2226,47 +2467,120 @@ class AgroSightViewModel(
         }
     }
 
-    fun syncCurrentWorkspaceToFirestore() {
+    fun retryCloudWorkspaceRestore() {
         val st = _uiState.value
-        val uid = st.firebaseUserUid ?: return
-        if (st.isFirebaseSyncing) return
-        _uiState.update { it.copy(isFirebaseSyncing = true) }
+        val uid = st.firebaseUserUid?.trim() ?: return
+        if (uid.isBlank()) return
         viewModelScope.launch {
-            try {
-                val res = firestoreRepository.upsertFarmerWorkspace(
-                    userId = uid,
-                    farmerName = st.activeFarmer.fullName,
-                    whatsappPhone = st.activeFarmer.whatsappPhone,
-                    gmailAddress = st.firebaseUserEmail ?: st.activeFarmer.gmailAddress,
-                    nationalId = st.activeFarmer.nationalId,
-                    fieldName = st.fieldName,
-                    region = st.activeFarmer.region,
-                    cropType = st.selectedCrop.nameAr,
-                    areaFeddans = st.areaFeddans,
-                    latitude = st.latitude,
-                    longitude = st.longitude,
-                    soilPh = st.soilPh,
-                    soilEce = st.soilEce,
-                    waterEcw = st.waterEcw,
-                    ndviMean = st.epidemiologyReport.ndviMean,
-                    ndreMean = st.epidemiologyReport.ndreMean,
-                    psriMean = st.epidemiologyReport.psriMean,
-                    ndmiMean = st.epidemiologyReport.ndmiMean,
-                    detectedRiskName = st.epidemiologyReport.detectedRiskNameAr
+            restoreAndObserveCloudWorkspaceForUser(
+                uid = uid,
+                email = st.firebaseUserEmail,
+                displayName = st.firebaseUserDisplayName
+            )
+        }
+    }
+
+    private suspend fun performValidatedWorkspaceUpsertLocked(uid: String) {
+        val st = _uiState.value
+        if (st.firebaseUserUid != uid || restoredCloudWorkspaceForUid != uid) return
+        if (st.activeFarmer.isDemoAccount) return
+        _uiState.update { it.copy(isFirebaseSyncing = true) }
+        try {
+            val res = firestoreRepository.upsertFarmerWorkspace(
+                userId = uid,
+                farmerName = st.activeFarmer.fullName,
+                whatsappPhone = st.activeFarmer.whatsappPhone,
+                gmailAddress = st.firebaseUserEmail ?: st.activeFarmer.gmailAddress,
+                nationalId = st.activeFarmer.nationalId,
+                fieldName = st.fieldName,
+                region = st.activeFarmer.region,
+                cropType = st.selectedCrop.nameAr,
+                areaFeddans = st.areaFeddans,
+                latitude = st.latitude,
+                longitude = st.longitude,
+                soilPh = st.soilPh,
+                soilEce = st.soilEce,
+                waterEcw = st.waterEcw,
+                ndviMean = st.epidemiologyReport.ndviMean,
+                ndreMean = st.epidemiologyReport.ndreMean,
+                psriMean = st.epidemiologyReport.psriMean,
+                ndmiMean = st.epidemiologyReport.ndmiMean,
+                detectedRiskName = st.epidemiologyReport.detectedRiskNameAr
+            )
+            _uiState.update {
+                it.copy(
+                    firebaseCloudStatusAr = if (res.isSuccess) {
+                        "تمت مزامنة بيانات المزرعة والتربة والأقمار الصناعية مع Firestore بنجاح ✅"
+                    } else {
+                        "تنبيه مزامنة Firestore: ${res.exceptionOrNull()?.localizedMessage ?: "خطأ"}"
+                    }
                 )
-                _uiState.update {
-                    it.copy(
-                        firebaseCloudStatusAr = if (res.isSuccess) {
-                            "تمت مزامنة بيانات المزرعة والتربة والأقمار الصناعية مع Firestore بنجاح ✅"
-                        } else {
-                            "تنبيه مزامنة Firestore: ${res.exceptionOrNull()?.localizedMessage ?: "خطأ"}"
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } finally {
+            _uiState.update { it.copy(isFirebaseSyncing = false) }
+        }
+    }
+
+    fun syncCurrentWorkspaceToFirestore() {
+        val uid = _uiState.value.firebaseUserUid?.trim() ?: return
+        if (uid.isBlank()) return
+        viewModelScope.launch {
+            cloudSyncMutex.withLock {
+                if (_uiState.value.firebaseUserUid != uid) return@withLock
+                // Strict restore-before-sync gate: never write to Firestore until initial cloud restore for [uid] succeeds
+                if (restoredCloudWorkspaceForUid != uid) {
+                    val fetchRes = firestoreRepository.fetchFarmerWorkspace(uid)
+                    if (fetchRes.isFailure) {
+                        _uiState.update {
+                            it.copy(
+                                isCloudWorkspaceRestored = false,
+                                cloudRestoreErrorAr = fetchRes.exceptionOrNull()?.message ?: "تعذر استعادة السحابة قبل المزامنة",
+                                firebaseCloudStatusAr = "تم إيقاف الكتابة السحابية لحين استعادة مساحة العمل من Firestore بأمان"
+                            )
                         }
-                    )
+                        return@withLock
+                    }
+                    val existingWs = fetchRes.getOrNull()
+                    if (existingWs != null) {
+                        if (existingWs.userId.isNotBlank() && existingWs.userId != uid) {
+                            _uiState.update {
+                                it.copy(
+                                    isCloudWorkspaceRestored = false,
+                                    cloudRestoreErrorAr = "تعارض ملكية مساحة العمل (${existingWs.userId} != $uid)"
+                                )
+                            }
+                            return@withLock
+                        }
+                        val mergedSnap = databaseService.restoreOrMergeCloudFarmerWorkspace(
+                            authenticatedUid = uid,
+                            workspace = existingWs
+                        )
+                        applyTenantSnapshotToUiState(mergedSnap)
+                        restoredCloudWorkspaceForUid = uid
+                        _uiState.update {
+                            it.copy(
+                                cloudWorkspace = existingWs.copy(userId = uid),
+                                isCloudWorkspaceRestored = true,
+                                restoredCloudWorkspaceUid = uid,
+                                cloudRestoreErrorAr = null,
+                                firebaseCloudStatusAr = "تم استعادة مساحة العمل السحابية قبل المزامنة ✅"
+                            )
+                        }
+                        return@withLock
+                    } else {
+                        restoredCloudWorkspaceForUid = uid
+                        _uiState.update {
+                            it.copy(
+                                isCloudWorkspaceRestored = true,
+                                restoredCloudWorkspaceUid = uid,
+                                cloudRestoreErrorAr = null
+                            )
+                        }
+                    }
                 }
-            } catch (e: CancellationException) {
-                throw e
-            } finally {
-                _uiState.update { it.copy(isFirebaseSyncing = false) }
+                performValidatedWorkspaceUpsertLocked(uid)
             }
         }
     }

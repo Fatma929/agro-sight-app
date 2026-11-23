@@ -1,0 +1,18 @@
+{
+  "name": "agrosight-firestore-rules-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Reproducible Firestore security rules unit test suite for AgroSight (Phase C.1)",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "test": "firebase emulators:exec --only firestore --project demo-no-project \"node --test firestore.test.js\"",
+    "test:rules:direct": "node --test firestore.test.js",
+    "test:rules:emulator": "firebase emulators:exec --only firestore --project demo-no-project \"node --test firestore.test.js\""
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^3.0.1",
+    "firebase-tools": "^13.0.0"
+  }
+}

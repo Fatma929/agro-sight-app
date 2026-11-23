@@ -264,7 +264,7 @@ class GeminiAgroService(
             ?: agriculturalContext?.environmental?.observationDateIso
             ?: agriculturalContext?.generatedAtDateIso
         val dataSourceModeLabelAr = agriculturalContext?.let { ctx ->
-            "${ctx.satellite.dataMode.badgeAr} (${ctx.satellite.dataMode.name})"
+            "${ctx.satellite.dataStatus.badgeAr} (${ctx.satellite.dataStatus.name} / ${ctx.satellite.dataMode.name})"
         }
 
         val modeDirective = when (responseMode) {

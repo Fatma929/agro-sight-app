@@ -1674,6 +1674,49 @@ class TestSentinel2OperationalRasterPipeline(unittest.TestCase):
             "Importing backend.app must not create .signed_url_secret on disk",
         )
 
+    def test_phase_c1_part7_and_part9_formula_parity_and_config_readiness(self):
+        """
+        Phase C.1 Part 7 & Part 9:
+        1. Verify Python evaluate_pixel produces exact values matching Android Kotlin
+           Sentinel2BandMathEngine for identical band reflectances:
+           B02=0.04, B04=0.08, B05=0.14, B06=0.25, B08=0.42, B8A=0.40, B11=0.18, SCL=4.
+        2. Verify get_health() and get_configuration_readiness() explicitly report fallback project IDs,
+           service-account presence, and production_ready status without exposing secrets.
+        """
+        from raster_service import evaluate_pixel
+
+        eval_res = evaluate_pixel(
+            b02_blue=0.04,
+            b04_red=0.08,
+            b05_red_edge1=0.14,
+            b06_red_edge2=0.25,
+            b08_nir=0.42,
+            b8a_narrow_nir=0.40,
+            b11_swir1=0.18,
+            scl_class=4,
+        )
+        self.assertTrue(eval_res.is_valid)
+        self.assertAlmostEqual(eval_res.ndvi, (0.42 - 0.08) / (0.42 + 0.08), places=6)
+        self.assertAlmostEqual(eval_res.ndre, (0.40 - 0.14) / (0.40 + 0.14), places=6)
+        self.assertAlmostEqual(eval_res.ndmi, (0.42 - 0.18) / (0.42 + 0.18), places=6)
+        self.assertAlmostEqual(eval_res.psri, (0.08 - 0.04) / 0.25, places=6)
+
+        svc = SatelliteBackendService(
+            storage_root=os.path.join(self.temp_dir, "c1_health_storage"),
+            environment="TEST",
+        )
+        status_code, health = svc.get_health()
+        self.assertEqual(status_code, 200)
+        self.assertIn("firebase_project_id_source", health)
+        self.assertIn("using_fallback_firebase_project_id", health)
+        self.assertIn("google_services_json_present", health)
+        self.assertIn("service_account_configured", health)
+        self.assertIn("signed_url_secret_explicitly_configured", health)
+        self.assertIn("production_ready", health)
+        self.assertIn("configuration_warnings", health)
+        self.assertIsInstance(health["configuration_warnings"], list)
+
 
 if __name__ == "__main__":
     unittest.main()
+

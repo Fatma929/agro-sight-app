@@ -54,29 +54,29 @@ enum class SpectralRadarLayer(
     NDRE(
         "NDRE",
         "NDRE الكلوروفيل المبكر",
-        "NDRE (مؤشر الكلوروفيل المبكر - Red Edge B8A/B5)",
-        "(B8A - B5) / (B8A + B5)",
+        "NDRE (مؤشر الكلوروفيل المبكر - Red Edge B8A/B05)",
+        "(B8A - B05) / (B8A + B05)",
         "يكشف الإجهاد الفسيولوجي وتراجع الكلوروفيل قبل ظهور الأعراض بالعين بـ 7 أيام"
     ),
     PSRI(
         "PSRI",
         "PSRI تلف الأنسجة",
-        "PSRI (مؤشر تلف وشيخوخة الأنسجة - B4-B3/B6)",
-        "(B4 - B3) / B6",
+        "PSRI (مؤشر تلف وشيخوخة الأنسجة - (B04-B02)/B06)",
+        "(B04 - B02) / B06",
         "يرصد البؤر الفطرية والبكتيرية وتراكم الكاروتينات وموت الأنسجة باللون القرمزي"
     ),
     NDMI(
         "NDMI",
         "NDMI الرطوبة والتغدق",
-        "NDMI (مؤشر الرطوبة والتغدق - B8/B11)",
-        "(B8 - B11) / (B8 + B11)",
+        "NDMI (مؤشر الرطوبة والتغدق - B08/B11)",
+        "(B08 - B11) / (B08 + B11)",
         "يحدد مناطق التغدق المسببة لأعفان الجذور مقابل مناطق العطش وانسداد النقاطات"
     ),
     NDVI(
         "NDVI",
         "NDVI الغطاء العام",
-        "NDVI (كثافة الغطاء النباتي العام - B8/B4)",
-        "(B8 - B4) / (B8 + B4)",
+        "NDVI (كثافة الغطاء النباتي العام - B08/B04)",
+        "(B08 - B04) / (B08 + B04)",
         "يقيس الكتلة الحيوية الكلية وكثافة المجموع الخضري للمحصول"
     )
 }
@@ -271,7 +271,7 @@ class DatabaseService(context: Context? = null) {
                     anomalyPattern = AnomalyPattern.FOCAL_RADIAL_PATCH,
                     infectedAreaFeddans = 0.25f,
                     hotspotCoordinates = "محبس 3 - القطاع التجريبي (30.4028°N, 30.3392°E)",
-                    detectedRiskName = "رصد مبكر لبؤرة الندوة المتأخرة (Phytophthora infestans)",
+                    detectedRiskName = "ملاحظة تباين طيفي موضعي عند قطاع المحبس #3 — يتطلب معاينة ميدانية",
                     confidenceScore = 93
                 )
                 fields.add(0, adminField)
@@ -675,43 +675,11 @@ class DatabaseService(context: Context? = null) {
             soilEc = 2.3f,
             waterEc = 1.3f
         )
-        val newScan = SatelliteSpectralScanEntity(
-            id = "scan_${spectralScans.size + 1}",
-            fieldId = newFieldId,
-            scanDate = LocalDate.now().toString(),
-            ndviMean = 0.68f,
-            ndreMean = 0.34f,
-            psriMean = 0.19f,
-            ndmiMean = 0.36f,
-            anomalyPattern = AnomalyPattern.FOCAL_RADIAL_PATCH,
-            infectedAreaFeddans = 0.35f,
-            hotspotCoordinates = "محبس 3 - الركن الشمالي الشرقي (30.3841°N, 30.3512°E)",
-            detectedRiskName = "بؤرة مبكرة لمرض اللفحة المتأخرة (Phytophthora infestans)",
-            confidenceScore = 89
-        )
-        val welcomeMsg = WhatsAppMessageEntity(
-            id = "wa_${whatsappMessages.size + 1}",
-            farmerId = newFarmerId,
-            fieldId = newFieldId,
-            timestamp = currentTimeFormatted(),
-            direction = WhatsAppDirection.OUTBOUND_ALERT,
-            alertCategory = WhatsAppAlertCategory.SATELLITE_DISEASE_WARNING,
-            messageText = buildProactiveDiseaseWhatsAppText(
-                farmerName = cleanName,
-                fieldName = newField.fieldName,
-                scan = newScan,
-                humidityPct = 76,
-                reducedHours = 1.6f,
-                preventiveRecommendation = "رش بؤرة المحبس 3 فقط بمبيد مانكوزيب + ميتالاكسيل بمعدل وقائي مع وقف التسميد الآزوتي لمدة 48 ساعة"
-            ),
-            status = "DELIVERED"
-        )
-
+        // Real farmer accounts (isDemoAccount = false) start clean without fabricated satellite scans,
+        // fake disease alerts, chemical pesticide prescriptions, or fake DELIVERED WhatsApp messages.
         farmers.add(newFarmer)
         fields.add(newField)
         soilProfiles.add(newSoil)
-        spectralScans.add(0, newScan)
-        whatsappMessages.add(welcomeMsg)
         activeFarmerId = newFarmerId
         saveToPersistence()
         return getSnapshot()
@@ -776,6 +744,193 @@ class DatabaseService(context: Context? = null) {
         return getSnapshot()
     }
 
+    /**
+     * Restores and merges a validated [FarmerCloudWorkspace] from Firestore into an isolated
+     * local tenant scoped strictly to [authenticatedUid].
+     *
+     * Rejects mismatched workspace ownership (`workspace.userId != authenticatedUid`) or blank UIDs.
+     * Does not fabricate satellite scans if the cloud workspace has no recorded spectral indices.
+     */
+    fun restoreOrMergeCloudFarmerWorkspace(
+        authenticatedUid: String,
+        workspace: FarmerCloudWorkspace
+    ): RelationalDatabaseSnapshot {
+        val cleanUid = authenticatedUid.trim()
+        require(cleanUid.isNotBlank()) { "Authenticated UID cannot be blank during cloud restore" }
+        if (workspace.userId.isNotBlank() && workspace.userId != cleanUid) {
+            throw SecurityException(
+                "Cross-user workspace restore blocked: workspace.userId (${workspace.userId}) != authenticatedUid ($cleanUid)"
+            )
+        }
+
+        val existingFarmerIdx = farmers.indexOfFirst { it.id == cleanUid }
+        val existingFarmer = if (existingFarmerIdx >= 0) farmers[existingFarmerIdx] else null
+        val resolvedRole = runCatching { UserRole.valueOf(workspace.role) }
+            .getOrDefault(existingFarmer?.role ?: UserRole.FARMER)
+        val resolvedStatus = runCatching { AccountStatus.valueOf(workspace.accountStatus) }
+            .getOrDefault(existingFarmer?.accountStatus ?: AccountStatus.ACTIVE)
+
+        val mergedFarmer = FarmerEntity(
+            id = cleanUid,
+            fullName = workspace.farmerName.ifBlank { existingFarmer?.fullName ?: "مزارع أجرو سايت ($cleanUid)" },
+            whatsappPhone = existingFarmer?.whatsappPhone.orEmpty(),
+            gmailAddress = existingFarmer?.gmailAddress.orEmpty(),
+            nationalId = existingFarmer?.nationalId.orEmpty(),
+            region = workspace.region.ifBlank { existingFarmer?.region ?: "وادي النطرون" },
+            preferredAlertTime = existingFarmer?.preferredAlertTime ?: "06:30 ص",
+            role = resolvedRole,
+            accountStatus = resolvedStatus,
+            lastLoginAt = currentTimeFormatted(),
+            isDemoAccount = false
+        )
+        if (existingFarmerIdx >= 0) {
+            farmers[existingFarmerIdx] = mergedFarmer
+        } else {
+            farmers.add(mergedFarmer)
+        }
+
+        val existingFieldIdx = fields.indexOfFirst { it.farmerId == cleanUid }
+        val fieldId = if (existingFieldIdx >= 0) fields[existingFieldIdx].id else "field_cloud_$cleanUid"
+        val existingField = if (existingFieldIdx >= 0) fields[existingFieldIdx] else null
+        val cloudArea = workspace.areaFeddans.toFloat()
+        val mergedField = FieldEntity(
+            id = fieldId,
+            farmerId = cleanUid,
+            fieldName = workspace.fieldName.ifBlank { existingField?.fieldName ?: "مزرعة ${mergedFarmer.fullName}" },
+            lat = if (workspace.latitude != 0.0) workspace.latitude else (existingField?.lat ?: 30.3833),
+            lon = if (workspace.longitude != 0.0) workspace.longitude else (existingField?.lon ?: 30.3500),
+            areaFeddans = if (cloudArea > 0f) cloudArea else (existingField?.areaFeddans ?: 50f),
+            cropType = workspace.cropType.ifBlank { existingField?.cropType ?: "قمح" },
+            plantingDate = existingField?.plantingDate ?: LocalDate.now().minusDays(60).toString(),
+            irrigationType = existingField?.irrigationType ?: "تنقيط (Drip)",
+            flowRateM3Hr = existingField?.flowRateM3Hr ?: 16.0f
+        )
+        if (existingFieldIdx >= 0) {
+            fields[existingFieldIdx] = mergedField
+        } else {
+            fields.add(mergedField)
+        }
+
+        val existingSoilIdx = soilProfiles.indexOfFirst { it.fieldId == fieldId }
+        val existingSoil = if (existingSoilIdx >= 0) soilProfiles[existingSoilIdx] else null
+        val cloudPh = workspace.soilPh.toFloat()
+        val cloudEce = workspace.soilEce.toFloat()
+        val cloudEcw = workspace.waterEcw.toFloat()
+        val mergedSoil = SoilProfileEntity(
+            id = existingSoil?.id ?: "soil_cloud_$cleanUid",
+            fieldId = fieldId,
+            soilTexture = existingSoil?.soilTexture ?: "رملية طميية (Sandy Loam)",
+            soilPh = if (cloudPh > 0f) cloudPh else (existingSoil?.soilPh ?: 7.4f),
+            soilEc = if (cloudEce > 0f) cloudEce else (existingSoil?.soilEc ?: 1.8f),
+            waterEc = if (cloudEcw > 0f) cloudEcw else (existingSoil?.waterEc ?: 1.1f)
+        )
+        if (existingSoilIdx >= 0) {
+            soilProfiles[existingSoilIdx] = mergedSoil
+        } else {
+            soilProfiles.add(mergedSoil)
+        }
+
+        val cloudNdvi = workspace.ndviMean.toFloat()
+        val cloudNdre = workspace.ndreMean.toFloat()
+        val cloudPsri = workspace.psriMean.toFloat()
+        val cloudNdmi = workspace.ndmiMean.toFloat()
+        val hasCloudSpectralObservation =
+            cloudNdvi > 0f || cloudNdre > 0f || cloudPsri > 0f || cloudNdmi > 0f
+        spectralScans.removeAll { it.fieldId == fieldId }
+        if (hasCloudSpectralObservation) {
+            spectralScans.add(
+                0,
+                SatelliteSpectralScanEntity(
+                    id = "scan_cloud_$cleanUid",
+                    fieldId = fieldId,
+                    scanDate = LocalDate.now().toString(),
+                    ndviMean = cloudNdvi,
+                    ndreMean = cloudNdre,
+                    psriMean = cloudPsri,
+                    ndmiMean = cloudNdmi,
+                    anomalyPattern = AnomalyPattern.FOCAL_RADIAL_PATCH,
+                    infectedAreaFeddans = 0.25f,
+                    hotspotCoordinates = "قطاع الرصد السحابي (${mergedField.lat}°N, ${mergedField.lon}°E)",
+                    detectedRiskName = workspace.detectedRiskName.ifBlank {
+                        "رصد طيفي مستعاد من مساحة العمل السحابية — يتطلب معاينة ميدانية"
+                    },
+                    confidenceScore = 88
+                )
+            )
+        }
+
+        activeFarmerId = cleanUid
+        saveToPersistence()
+        return getSnapshot()
+    }
+
+    /**
+     * Ensures an authenticated Firebase user [authenticatedUid] operates in an isolated local tenant
+     * rather than inheriting or overwriting another user's local workspace when switching accounts.
+     */
+    fun ensureIsolatedLocalTenantForCloudUid(
+        authenticatedUid: String,
+        displayName: String? = null,
+        email: String? = null
+    ): RelationalDatabaseSnapshot {
+        val cleanUid = authenticatedUid.trim()
+        require(cleanUid.isNotBlank()) { "Authenticated UID cannot be blank" }
+        val existingFarmer = farmers.find { it.id == cleanUid }
+        if (existingFarmer != null) {
+            activeFarmerId = cleanUid
+            saveToPersistence()
+            return getSnapshot()
+        }
+
+        val cleanName = displayName?.trim()?.takeIf { it.isNotBlank() } ?: "مزارع أجرو سايت ($cleanUid)"
+        val cleanEmail = email?.trim().orEmpty()
+        val resolvedRole = if (cleanEmail.equals(UserRole.BOOTSTRAPPED_ADMIN_EMAIL, ignoreCase = true)) {
+            UserRole.SUPER_ADMIN
+        } else {
+            UserRole.FARMER
+        }
+        val newFarmer = FarmerEntity(
+            id = cleanUid,
+            fullName = cleanName,
+            whatsappPhone = "",
+            gmailAddress = cleanEmail,
+            nationalId = "",
+            region = "وادي النطرون",
+            preferredAlertTime = "06:30 ص",
+            role = resolvedRole,
+            accountStatus = AccountStatus.ACTIVE,
+            lastLoginAt = currentTimeFormatted(),
+            isDemoAccount = false
+        )
+        val fieldId = "field_cloud_$cleanUid"
+        val newField = FieldEntity(
+            id = fieldId,
+            farmerId = cleanUid,
+            fieldName = "مزرعة $cleanName - وادي النطرون",
+            lat = 30.3833,
+            lon = 30.3500,
+            areaFeddans = 50f,
+            cropType = "قمح",
+            plantingDate = LocalDate.now().minusDays(60).toString(),
+            irrigationType = "تنقيط (Drip)",
+            flowRateM3Hr = 16.0f
+        )
+        val newSoil = SoilProfileEntity(
+            id = "soil_cloud_$cleanUid",
+            fieldId = fieldId,
+            soilTexture = "رملية طميية (Sandy Loam)",
+            soilPh = 7.4f,
+            soilEc = 1.8f,
+            waterEc = 1.1f
+        )
+        farmers.add(newFarmer)
+        fields.add(newField)
+        soilProfiles.add(newSoil)
+        activeFarmerId = cleanUid
+        saveToPersistence()
+        return getSnapshot()
+    }
+
     private fun seedDefaultEgyptianTenants() {
         farmers.clear()
         fields.clear()
@@ -830,7 +985,7 @@ class DatabaseService(context: Context? = null) {
             anomalyPattern = AnomalyPattern.FOCAL_RADIAL_PATCH,
             infectedAreaFeddans = 0.25f,
             hotspotCoordinates = "محبس 3 - القطاع التجريبي (30.4028°N, 30.3392°E)",
-            detectedRiskName = "رصد مبكر لبؤرة الندوة المتأخرة (Phytophthora infestans)",
+            detectedRiskName = "ملاحظة تباين طيفي موضعي عند قطاع المحبس #3 — يتطلب معاينة ميدانية",
             confidenceScore = 93
         )
         farmers.add(fAdmin)
@@ -1046,7 +1201,7 @@ class DatabaseService(context: Context? = null) {
                     scan = scan1,
                     humidityPct = 78,
                     reducedHours = 1.4f,
-                    preventiveRecommendation = "رش بؤرة المحبس 3 فقط (0.4 فدان) بمبيد فطري متخصص (ميتالاكسيل + مانكوزيب) وتجنب رش الحقل بالكامل لتوفير 85% من تكلفة المبيدات."
+                    preventiveRecommendation = "معاينة بؤرة المحبس 3 ميدانياً (0.4 فدان) وفحص الأوراق السفلية ومراجعة مهندس زراعي مختص قبل أي قرار علاجي (يُحظر رش أي مبيد كيميائي بدون معاينة حقلية)."
                 ),
                 status = "READ"
             )

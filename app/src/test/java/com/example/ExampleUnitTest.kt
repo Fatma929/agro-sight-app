@@ -238,13 +238,181 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun `OpenMeteoClient buildFallbackForecast labels offline fallback explicitly as DEMO_ESTIMATED`() {
-        val result = OpenMeteoClient().buildFallbackForecast(30.3833, 30.3500, 1.15f, isLive = false)
-        assertFalse(result.isLiveConnected)
-        assertEquals(TelemetryDataMode.DEMO_ESTIMATED, result.dataMode)
-        assertEquals(7, result.records.size)
-        assertTrue(result.records.all { it.et0MmDay > 2.0f })
-        assertTrue(result.statusMessageAr.contains("Offline Baseline"))
+    fun `OpenMeteoClient buildFallbackForecast enforces FALLBACK or DEMO mode and never claims LIVE`() {
+        val client = OpenMeteoClient()
+        val fallbackResult = client.buildFallbackForecast(30.3833, 30.3500, 1.15f, isLive = false)
+        assertFalse(fallbackResult.isLiveConnected)
+        assertEquals(TelemetryDataMode.FALLBACK, fallbackResult.dataMode)
+        assertEquals(7, fallbackResult.records.size)
+        assertTrue(fallbackResult.records.all { it.et0MmDay > 2.0f })
+        assertTrue(fallbackResult.statusMessageAr.contains("Offline Baseline"))
+        assertTrue(fallbackResult.source.contains("AgroSight Regional FAO-56"))
+        assertNotNull(OpenMeteoClient.parseValidIsoDateOrNull(fallbackResult.observationTimestampIso))
+        assertTrue(fallbackResult.retrievalTimestampIso.isNotBlank())
+        assertTrue(fallbackResult.units.containsKey("et0_fao_evapotranspiration"))
+
+        // Even if a caller passes isLive = true or fallbackDataMode = LIVE to buildFallbackForecast,
+        // it must strictly clamp to isLiveConnected = false and TelemetryDataMode.FALLBACK.
+        val attemptedLiveFallback = client.buildFallbackForecast(
+            latitude = 30.3833,
+            longitude = 30.3500,
+            baseKc = 1.15f,
+            isLive = true,
+            fallbackDataMode = TelemetryDataMode.LIVE
+        )
+        assertFalse("Fallback forecast must never mark isLiveConnected = true", attemptedLiveFallback.isLiveConnected)
+        assertEquals("Fallback forecast must never use TelemetryDataMode.LIVE", TelemetryDataMode.FALLBACK, attemptedLiveFallback.dataMode)
+
+        // Explicit DEMO mode fallback
+        val demoResult = client.buildFallbackForecast(
+            latitude = 30.3833,
+            longitude = 30.3500,
+            baseKc = 1.15f,
+            isLive = false,
+            fallbackDataMode = TelemetryDataMode.DEMO
+        )
+        assertFalse(demoResult.isLiveConnected)
+        assertEquals(TelemetryDataMode.DEMO, demoResult.dataMode)
+
+        // Explicit UNAVAILABLE result
+        val unavailableResult = client.buildUnavailableResult("Service unreachable")
+        assertFalse(unavailableResult.isLiveConnected)
+        assertEquals(TelemetryDataMode.UNAVAILABLE, unavailableResult.dataMode)
+        assertTrue(unavailableResult.records.isEmpty())
+    }
+
+    @Test
+    fun `OpenMeteoClient validates ISO timestamps, rejects malformed dates, and enforces freshness thresholds`() {
+        val client = OpenMeteoClient()
+
+        // 1. Valid vs malformed date strings
+        assertNotNull(OpenMeteoClient.parseValidIsoDateOrNull("2026-05-14"))
+        assertNotNull(OpenMeteoClient.parseValidIsoDateOrNull("2026-05-14T10:30:00Z"))
+        assertEquals(null, OpenMeteoClient.parseValidIsoDateOrNull(""))
+        assertEquals(null, OpenMeteoClient.parseValidIsoDateOrNull("not-a-date"))
+        assertEquals(null, OpenMeteoClient.parseValidIsoDateOrNull("2026-13-45"))
+        assertEquals(null, OpenMeteoClient.parseValidIsoDateOrNull("2026/05/14"))
+
+        // 2. Freshness threshold enforcement (<= 1 day is fresh, > 1 day or malformed is stale)
+        val refDate = java.time.LocalDate.of(2026, 5, 14)
+        assertTrue(OpenMeteoClient.isObservationTimestampFresh("2026-05-14", referenceDate = refDate))
+        assertTrue(OpenMeteoClient.isObservationTimestampFresh("2026-05-13", referenceDate = refDate))
+        assertFalse(OpenMeteoClient.isObservationTimestampFresh("2026-05-11", referenceDate = refDate))
+        assertFalse(OpenMeteoClient.isObservationTimestampFresh("invalid-date", referenceDate = refDate))
+
+        // 3. parseOpenMeteoJson rejects malformed timestamps in Open-Meteo payload
+        val malformedJson = """
+            {
+              "daily": {
+                "time": ["2026-99-99"],
+                "temperature_2m_max": [32.0],
+                "temperature_2m_min": [19.0],
+                "et0_fao_evapotranspiration": [6.1]
+              }
+            }
+        """.trimIndent()
+        var malformedRejected = false
+        try {
+            client.parseOpenMeteoJson(malformedJson, baseKc = 1.15f)
+        } catch (_: IllegalArgumentException) {
+            malformedRejected = true
+        }
+        assertTrue("Malformed date in Open-Meteo JSON must be rejected", malformedRejected)
+
+        // 4. OpenMeteoResult invariant: FALLBACK/CACHED/DEMO/UNAVAILABLE cannot have isLiveConnected = true
+        var invariantEnforced = false
+        try {
+            com.example.data.OpenMeteoResult(
+                records = emptyList(),
+                alerts = emptyList(),
+                isLiveConnected = true,
+                dataMode = TelemetryDataMode.FALLBACK,
+                httpStatusCode = 200,
+                statusMessageAr = "Invalid state"
+            )
+        } catch (_: IllegalArgumentException) {
+            invariantEnforced = true
+        }
+        assertTrue("OpenMeteoResult must forbid isLiveConnected=true when dataMode != LIVE", invariantEnforced)
+    }
+
+    @Test
+    fun `Part 3 real farmer account creation never injects fabricated satellite scans, disease alerts, chemical prescriptions, or DELIVERED WhatsApp messages`() {
+        val db = DatabaseService(context = null)
+
+        // 1. Register a brand-new real farmer via mobile number
+        val (loginOk, _, snapAfterRegister) = db.authenticateBySingleIdentifier(
+            AuthLoginChannel.MOBILE_NUMBER,
+            "01099887766"
+        )
+        assertTrue(loginOk)
+        val realFarmer = snapAfterRegister.farmers.first { it.id == snapAfterRegister.activeFarmerId }
+        assertFalse("New farmer account must be a real farmer account (isDemoAccount = false)", realFarmer.isDemoAccount)
+
+        val realFarmerFieldIds = snapAfterRegister.fields
+            .filter { it.farmerId == realFarmer.id }
+            .map { it.id }
+            .toSet()
+        assertTrue("Real farmer must have an initialized field record", realFarmerFieldIds.isNotEmpty())
+
+        // 2. Verify ZERO fabricated satellite scans exist for the new real farmer's fields
+        val realFarmerScans = snapAfterRegister.satelliteSpectralScans.filter { it.fieldId in realFarmerFieldIds }
+        assertTrue(
+            "Real farmer account must start with 0 fabricated satellite scans (found ${realFarmerScans.size})",
+            realFarmerScans.isEmpty()
+        )
+
+        // 3. Verify ZERO fake DELIVERED WhatsApp messages or chemical prescriptions exist for the new real farmer
+        val realFarmerMessages = snapAfterRegister.whatsappMessages.filter { it.farmerId == realFarmer.id }
+        assertTrue(
+            "Real farmer account must start with 0 fabricated DELIVERED WhatsApp messages (found ${realFarmerMessages.size})",
+            realFarmerMessages.isEmpty()
+        )
+
+        // 4. Verify no message or scan in the entire database contains automatic chemical pesticide prescriptions
+        val allScanNotes = snapAfterRegister.satelliteSpectralScans.joinToString(" ") { it.detectedRiskName }
+        assertFalse("No scan note may auto-diagnose Phytophthora infestans", allScanNotes.contains("Phytophthora"))
+        val allWhatsAppTexts = snapAfterRegister.whatsappMessages.joinToString(" ") { it.messageText }
+        assertFalse("No WhatsApp message may prescribe Mancozeb", allWhatsAppTexts.contains("مانكوزيب"))
+        assertFalse("No WhatsApp message may prescribe Metalaxyl", allWhatsAppTexts.contains("ميتالاكسيل"))
+    }
+
+    @Test
+    fun `Part 7 Sentinel-2 L2A spectral index formulas and documentation labels match Python backend exactly`() {
+        // 1. Verify SpectralRadarLayer formula documentation strings match Part 7 specification
+        assertEquals("(B08 - B04) / (B08 + B04)", com.example.data.SpectralRadarLayer.NDVI.bandFormula)
+        assertEquals("(B8A - B05) / (B8A + B05)", com.example.data.SpectralRadarLayer.NDRE.bandFormula)
+        assertEquals("(B08 - B11) / (B08 + B11)", com.example.data.SpectralRadarLayer.NDMI.bandFormula)
+        assertEquals("(B04 - B02) / B06", com.example.data.SpectralRadarLayer.PSRI.bandFormula)
+
+        // 2. Verify exact mathematical equivalence between Kotlin Sentinel2BandMathEngine and Python formulas
+        // Reference reflectance values:
+        // B02 (Blue) = 0.04, B04 (Red) = 0.08, B05 (Red-Edge 1) = 0.14, B06 (Red-Edge 2) = 0.25,
+        // B08 (NIR) = 0.42, B8A (Narrow NIR) = 0.40, B11 (SWIR 1) = 0.18, SCL = 4 (Vegetation)
+        val sample = Sentinel2PixelReflectance(
+            row = 0,
+            col = 0,
+            b02Blue = 0.04f,
+            b04Red = 0.08f,
+            b05RedEdge1 = 0.14f,
+            b06RedEdge2 = 0.25f,
+            b08Nir = 0.42f,
+            b8aNarrowNir = 0.40f,
+            b11Swir1 = 0.18f,
+            sclClass = 4
+        )
+        val computed = Sentinel2BandMathEngine.evaluatePixel(sample)
+
+        val expectedNdvi = (0.42f - 0.08f) / (0.42f + 0.08f) // 0.34 / 0.50 = 0.680000
+        val expectedNdre = (0.40f - 0.14f) / (0.40f + 0.14f) // 0.26 / 0.54 = 0.48148148
+        val expectedNdmi = (0.42f - 0.18f) / (0.42f + 0.18f) // 0.24 / 0.60 = 0.400000
+        val expectedPsri = (0.08f - 0.04f) / 0.25f           // 0.04 / 0.25 = 0.160000
+
+        assertTrue(computed.isValidUnmasked)
+        assertEquals(expectedNdvi, computed.ndvi!!, 1e-6f)
+        assertEquals(expectedNdre, computed.ndre!!, 1e-6f)
+        assertEquals(expectedNdmi, computed.ndmi!!, 1e-6f)
+        assertEquals(expectedPsri, computed.psri!!, 1e-6f)
     }
 
     @Test
@@ -549,6 +717,7 @@ class ExampleUnitTest {
         assertTrue("PRODUCTION must reject plain HTTP URLs", prodHttpRejected)
     }
 }
+
 
 
 

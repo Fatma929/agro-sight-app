@@ -50,9 +50,12 @@ data class AgriculturalContextSnapshot(
         appendLine()
 
         appendLine("[B] سياق القمر الصناعي Sentinel-2 وملفات GeoTIFF (Satellite & Spatial Context):")
-        appendLine("- حالة توفر بيانات القمر الصناعي: ${if (satellite.isAvailable) "متوفرة (AVAILABLE)" else "غير متوفرة (MISSING)"}")
-        appendLine("- مصدر البيانات ووضع التشغيل: ${satellite.dataSourceLabel} [${satellite.dataMode.name}]")
+        appendLine("- حالة توفر بيانات القمر الصناعي: ${if (satellite.isAvailable) "متوفرة (AVAILABLE)" else "غير متوفرة (MISSING)"} | حالة الموثوقية: ${satellite.dataStatus.name} (${satellite.dataStatus.badgeAr})")
+        appendLine("- مصدر البيانات ووضع التشغيل: ${satellite.dataSourceLabel} [${satellite.dataMode.name}] | رصد Sentinel-2 حي فعلي: ${if (satellite.isLiveSentinel2Observation) "نعم (LIVE_SENTINEL2)" else "لا (NON_LIVE / FALLBACK / DEMO)"}")
         appendLine("- تاريخ المسح الطيفي: ${satellite.analysisDateIso ?: "غير متوفر"} | عمر البيانات بالأيام: ${satellite.ageDays?.toString() ?: "غير معروف"} | حالة الحداثة: ${if (satellite.isStale) "قديمة وتحتاج تحديث (STALE)" else "حديثة (FRESH)"}")
+        appendLine("- الوحدات العلمية: ${satellite.unitsSummary}")
+        appendLine("- جودة المشهد والغطاء السحابي: ${satellite.qualityAndCloudSummaryAr}")
+        appendLine("- توفر المقارنة التاريخية: ${satellite.historicalAvailabilityAr}")
         if (satellite.isAvailable) {
             appendLine("- المؤشرات الطيفية المحسوبة: NDVI=${formatDecimal2(satellite.ndviMean)} | NDRE=${formatDecimal2(satellite.ndreMean)} | NDMI=${formatDecimal2(satellite.ndmiMean)} | PSRI=${formatDecimal2(satellite.psriMean)}")
             appendLine("- الرصد المكاني والبؤرة: ${satellite.detectedRiskNameAr} [النمط: ${satellite.anomalyPatternCode}] في (${satellite.hotspotLocationAr}) عند محبس #${satellite.affectedValveNumber} (مساحة متأثرة: ${formatDecimal1(satellite.infectedAreaFeddans)} فدان | توافق النمط الإرشادي: ${satellite.heuristicConsistencyPct}%)")
@@ -85,8 +88,10 @@ data class AgriculturalContextSnapshot(
         appendLine()
 
         appendLine("[C] سياق الري ومعادلات FAO-56 Penman-Monteith (Irrigation Context):")
-        appendLine("- حالة توفر حسابات الري: ${if (irrigation.isAvailable) "متوفرة (AVAILABLE)" else "غير متوفرة (MISSING)"}")
+        appendLine("- حالة توفر حسابات الري: ${if (irrigation.isAvailable) "متوفرة (AVAILABLE)" else "غير متوفرة (MISSING)"} | حالة البيانات: ${irrigation.dataStatus.name} (${irrigation.dataStatus.badgeAr})")
         appendLine("- تاريخ الحساب: ${irrigation.calculationDateIso} | المصدر: ${irrigation.dataSourceLabel}")
+        appendLine("- الوحدات الهيدروليكية: ${irrigation.unitsSummary}")
+        appendLine("- جودة الحساب وتوفر السجل التاريخي: ${irrigation.qualitySummaryAr} | ${irrigation.historicalAvailabilityAr}")
         appendLine("- البخر-نتح المرجعي ET0=${formatDecimal2(irrigation.et0MmDay)} مم/يوم | معامل المحصول الأساسي Kc=${formatDecimal2(irrigation.baseKc)} | معامل المحصول المدمج الفعلي Kc_fused=${formatDecimal2(irrigation.fusedKc)}")
         appendLine("- صافي استهلاك المحصول ETc=${formatDecimal2(irrigation.netEtcMmDay)} مم/يوم | الأمطار الفعالة=${formatDecimal2(irrigation.effectivePrecipitationMm)} مم")
         appendLine("- احتياج الغسيل الملحي=${irrigation.leachingRequirementPct}% | كفاءة نظام الري=${irrigation.applicationEfficiencyPct}%")
@@ -97,9 +102,10 @@ data class AgriculturalContextSnapshot(
         appendLine()
 
         appendLine("[D] السياق البيئي والأرصاد الجوية Open-Meteo (Environmental Context):")
-        appendLine("- حالة توفر بيانات الطقس: ${if (environmental.isAvailable) "متوفرة (AVAILABLE)" else "غير متوفرة (MISSING)"}")
-        appendLine("- تاريخ الرصد الجوي: ${environmental.observationDateIso ?: "غير متوفر"} | عمر البيانات بالأيام: ${environmental.ageDays?.toString() ?: "غير معروف"} | حالة الحداثة: ${if (environmental.isStale) "قديمة/مخزنة وتحتاج تحديث (STALE)" else "حديثة (FRESH)"}")
+        appendLine("- حالة توفر بيانات الطقس: ${if (environmental.isAvailable) "متوفرة (AVAILABLE)" else "غير متوفرة (MISSING)"} | حالة البيانات: ${environmental.dataStatus.name} (${environmental.dataStatus.badgeAr})")
+        appendLine("- تاريخ الرصد الجوي: ${environmental.observationDateIso ?: "غير متوفر"} | وقت الاسترجاع: ${environmental.retrievalTimestampIso.ifBlank { "غير متوفر" }} | عمر البيانات بالأيام: ${environmental.ageDays?.toString() ?: "غير معروف"} | حالة الحداثة: ${if (environmental.isStale) "قديمة/مخزنة وتحتاج تحديث (STALE)" else "حديثة (FRESH)"}")
         appendLine("- المصدر ووضع البيانات: ${environmental.dataSourceLabel} [${environmental.dataMode.name}]")
+        appendLine("- الوحدات الجوية: ${environmental.unitsSummary} | تقييم الجودة: ${environmental.qualitySummaryAr}")
         if (environmental.isAvailable) {
             appendLine("- الحرارة العظمى=${formatDecimal1(environmental.tempMaxC)}°C | الصغرى=${formatDecimal1(environmental.tempMinC)}°C | الأمطار=${formatDecimal1(environmental.precipitationMm)} مم")
             appendLine("- سرعة الرياح=${formatDecimal1(environmental.windSpeedKmh)} كم/ساعة | الرطوبة النسبية=${environmental.relativeHumidityPct}% | الإشعاع الشمسي=${formatDecimal1(environmental.solarRadiationMjM2)} MJ/m²")
@@ -193,6 +199,16 @@ data class HistoricalSatelliteComparison(
     val trendSummaryAr: String
 )
 
+enum class ScientificDataStatus(val badgeAr: String) {
+    LIVE("بيانات حية (LIVE)"),
+    CACHED("بيانات مخزنة مؤقتاً (CACHED)"),
+    FALLBACK("بيانات احتياطية غير حية (FALLBACK)"),
+    DEMO("وضع تجريبي (DEMO)"),
+    MISSING("غير متوفرة (MISSING)"),
+    STALE("قديمة وتحتاج تحديث (STALE)"),
+    UNAVAILABLE("غير متاحة (UNAVAILABLE)")
+}
+
 data class SatelliteContextSummary(
     val isAvailable: Boolean,
     val dataSourceLabel: String,
@@ -221,7 +237,12 @@ data class SatelliteContextSummary(
     val isBiologicalDisease: Boolean,
     val valveSectors: List<ValveSectorContextItem>,
     val historicalScans: List<HistoricalScanRecord>,
-    val historicalComparison: HistoricalSatelliteComparison?
+    val historicalComparison: HistoricalSatelliteComparison?,
+    val dataStatus: ScientificDataStatus = ScientificDataStatus.UNAVAILABLE,
+    val isLiveSentinel2Observation: Boolean = false,
+    val unitsSummary: String = "NDVI/NDRE/NDMI/PSRI: unitless reflectance ratio [-1.0..1.0]; cloudCover: %; area: feddan; resolution: m",
+    val qualityAndCloudSummaryAr: String = "",
+    val historicalAvailabilityAr: String = ""
 )
 
 data class ContextWeeklyIrrigationDayItem(
@@ -252,7 +273,11 @@ data class IrrigationContextSummary(
     val immediateIrrigationActionAr: String,
     val targetedPreventiveActionAr: String,
     val weeklyScheduleSummary: List<ContextWeeklyIrrigationDayItem>,
-    val recentIrrigationLogs: List<IrrigationAndTreatmentLogEntity>
+    val recentIrrigationLogs: List<IrrigationAndTreatmentLogEntity>,
+    val dataStatus: ScientificDataStatus = ScientificDataStatus.LIVE,
+    val unitsSummary: String = "ET0/ETc: mm/day; Kc: unitless; water: m³/feddan/day; totalWater: m³/day; valveTime: hours/day; acidDose: L/feddan; EC: dS/m",
+    val qualitySummaryAr: String = "",
+    val historicalAvailabilityAr: String = ""
 )
 
 data class EnvironmentalContextSummary(
@@ -271,7 +296,12 @@ data class EnvironmentalContextSummary(
     val solarRadiationMjM2: Float,
     val et0MmDay: Float,
     val forecastDayCount: Int,
-    val climaticAlerts: List<AgroClimaticAlert>
+    val climaticAlerts: List<AgroClimaticAlert>,
+    val dataStatus: ScientificDataStatus = ScientificDataStatus.FALLBACK,
+    val retrievalTimestampIso: String = "",
+    val units: Map<String, String> = OpenMeteoResult.DEFAULT_WEATHER_UNITS,
+    val unitsSummary: String = "temp: °C; precip: mm; wind: km/h; humidity: %; solarRadiation: MJ/m²/day; ET0: mm/day",
+    val qualitySummaryAr: String = ""
 )
 
 data class FarmActivityContextSummary(
@@ -356,7 +386,10 @@ object AgriculturalContextProvider {
         val rasterResult = uiState.rasterBackendResult
         val report = uiState.epidemiologyReport
 
-        val hasAnySatelliteRecord = (latestScanEntity != null || liveTelemetry != null || rasterResult != null) &&
+        val isLiveSentinel2 = rasterResult?.isLiveGeoreferencedRaster == true ||
+            (liveTelemetry?.stacAcquisitionStatus?.isUsableLiveScene == true && liveTelemetry.dataMode == TelemetryDataMode.LIVE)
+
+        val hasAnySatelliteRecord = (latestScanEntity != null || isLiveSentinel2 || rasterResult != null) &&
             report.ndviMean > 0f &&
             !java.lang.Float.isNaN(report.ndviMean)
 
@@ -365,24 +398,39 @@ object AgriculturalContextProvider {
             !liveTelemetry?.acquisitionDateIso.isNullOrBlank() -> liveTelemetry?.acquisitionDateIso
             else -> null
         }
-        val parsedSatelliteDate = parseIsoDateOrNull(rawSatelliteDate)
+        val parsedSatelliteDate = OpenMeteoClient.parseValidIsoDateOrNull(rawSatelliteDate)
+        val hasInvalidSatelliteTimestamp = !rawSatelliteDate.isNullOrBlank() && parsedSatelliteDate == null
         val satelliteAgeDays = parsedSatelliteDate?.let {
             ChronoUnit.DAYS.between(it, referenceDate).coerceAtLeast(0L)
         }
         val isSatelliteStale = hasAnySatelliteRecord &&
-            (satelliteAgeDays != null && satelliteAgeDays > SATELLITE_STALE_THRESHOLD_DAYS)
+            (hasInvalidSatelliteTimestamp || (satelliteAgeDays != null && satelliteAgeDays > SATELLITE_STALE_THRESHOLD_DAYS))
 
         val satelliteMode: TelemetryDataMode = when {
-            rasterResult?.isLiveGeoreferencedRaster == true ||
-                liveTelemetry?.stacAcquisitionStatus?.isUsableLiveScene == true -> TelemetryDataMode.LIVE
+            !hasAnySatelliteRecord -> TelemetryDataMode.UNAVAILABLE
+            isLiveSentinel2 -> TelemetryDataMode.LIVE
             uiState.isServingFromRoomOfflineCache -> TelemetryDataMode.CACHED
-            else -> liveTelemetry?.dataMode ?: TelemetryDataMode.DEMO_ESTIMATED
+            uiState.activeFarmer.isDemoAccount -> TelemetryDataMode.DEMO
+            else -> liveTelemetry?.dataMode ?: TelemetryDataMode.FALLBACK
         }
 
-        val satelliteSourceLabel = when (satelliteMode) {
-            TelemetryDataMode.LIVE -> "رصد حي Sentinel-2 L2A STAC / GeoTIFF"
-            TelemetryDataMode.CACHED -> "بيانات مخزنة محلياً (Room Offline Cache)"
-            TelemetryDataMode.DEMO_ESTIMATED -> "بيانات تقديرية لنموذج الحقل (Estimated Telemetry)"
+        val satelliteDataStatus: ScientificDataStatus = when {
+            !hasAnySatelliteRecord -> ScientificDataStatus.MISSING
+            isSatelliteStale -> ScientificDataStatus.STALE
+            isLiveSentinel2 -> ScientificDataStatus.LIVE
+            uiState.isServingFromRoomOfflineCache -> ScientificDataStatus.CACHED
+            uiState.activeFarmer.isDemoAccount || satelliteMode == TelemetryDataMode.DEMO || satelliteMode == TelemetryDataMode.DEMO_ESTIMATED ->
+                ScientificDataStatus.DEMO
+            else -> ScientificDataStatus.FALLBACK
+        }
+
+        val satelliteSourceLabel = when (satelliteDataStatus) {
+            ScientificDataStatus.LIVE -> "رصد حي Sentinel-2 L2A STAC / GeoTIFF"
+            ScientificDataStatus.CACHED -> "بيانات مخزنة محلياً (Room Offline Cache)"
+            ScientificDataStatus.STALE -> "بيانات مسح سابقة قديمة تحتاج تحديثاً (${rawSatelliteDate ?: "غير مؤرخة"})"
+            ScientificDataStatus.DEMO -> "بيانات نموذج استرشادي تجريبي (Demo Mode — ليست رصداً حياً من Sentinel-2)"
+            ScientificDataStatus.FALLBACK -> "بيانات تقديرية مرجعية للحقل (Fallback Baseline — ليست رصداً حياً من Sentinel-2)"
+            ScientificDataStatus.MISSING, ScientificDataStatus.UNAVAILABLE -> "لا يتوفر مسح طيفي مسجل لهذا الحقل حالياً (MISSING)"
         }
 
         val ndviMean = when {
@@ -460,23 +508,36 @@ object AgriculturalContextProvider {
             else -> null
         }
 
+        val cloudCoverVal = liveTelemetry?.cloudCoverPct
+        val validPxPct = rasterResult?.validPixelRatio?.let { it * 100f }
+        val qualitySummaryAr = when {
+            !hasAnySatelliteRecord -> "لا تتوفر بيانات طيفية لتقييم جودة المشهد أو الغطاء السحابي"
+            isLiveSentinel2 -> "رصد Sentinel-2 L2A مع قناع السحب SCL | تغطية السحب=${cloudCoverVal?.let { "${formatDecimal1(it)}%" } ?: "غير محددة"} | البكسلات الصالحة=${validPxPct?.let { "${formatDecimal1(it)}%" } ?: "100%"}"
+            else -> "بيانات غير حية (${satelliteDataStatus.name}) — لا تمثل رصداً فضائياً مباشراً من Sentinel-2 وتستخدم للإرشاد فقط"
+        }
+        val historicalAvailAr = if (historicalComparison != null) {
+            "متوفرة (${historicalComparison.scanCountForField} مسوحات موثقة، آخر مقارنة مع ${historicalComparison.previousScanDateIso})"
+        } else {
+            "غير متوفرة (يتطلب وجود مسحين مؤرخين على الأقل لنفس الحقل)"
+        }
+
         val satelliteSummary = SatelliteContextSummary(
             isAvailable = hasAnySatelliteRecord,
             dataSourceLabel = satelliteSourceLabel,
             dataMode = satelliteMode,
             sceneId = rasterResult?.sceneId ?: liveTelemetry?.sceneId ?: latestScanEntity?.id,
-            analysisDateIso = rawSatelliteDate,
+            analysisDateIso = parsedSatelliteDate?.toString() ?: rawSatelliteDate,
             ageDays = satelliteAgeDays,
             isStale = isSatelliteStale,
             ndviMean = if (hasAnySatelliteRecord) ndviMean else 0f,
             ndreMean = if (hasAnySatelliteRecord) ndreMean else 0f,
             ndmiMean = if (hasAnySatelliteRecord) ndmiMean else 0f,
             psriMean = if (hasAnySatelliteRecord) psriMean else 0f,
-            cloudCoverPct = liveTelemetry?.cloudCoverPct,
+            cloudCoverPct = cloudCoverVal,
             hasGeoTiffMetadata = hasGeoTiffMetadata,
             crsEpsg = crsEpsgString,
             spatialResolutionMeters = rasterResult?.spatialResolutionMeters?.toDouble(),
-            validPixelRatioPct = rasterResult?.validPixelRatio?.let { it * 100f },
+            validPixelRatioPct = validPxPct,
             availableGeoTiffIndices = availableGeoTiffIndices,
             downloadedGeoTiffSummaries = downloadedGeoTiffSummaries,
             anomalyPatternCode = report.anomalyPattern.code,
@@ -488,7 +549,11 @@ object AgriculturalContextProvider {
             isBiologicalDisease = report.isBiologicalDisease,
             valveSectors = valveSectorItems,
             historicalScans = historicalRecords,
-            historicalComparison = if (hasAnySatelliteRecord) historicalComparison else null
+            historicalComparison = if (hasAnySatelliteRecord) historicalComparison else null,
+            dataStatus = satelliteDataStatus,
+            isLiveSentinel2Observation = isLiveSentinel2,
+            qualityAndCloudSummaryAr = qualitySummaryAr,
+            historicalAvailabilityAr = historicalAvailAr
         )
 
         // C. Irrigation Context (Strictly from uiState.formulaAudit / forecastDays / weeklySchedule / valveSectors)
@@ -581,10 +646,61 @@ object AgriculturalContextProvider {
             )
         }
 
+        // D. Environmental Context (Open-Meteo observations, forecasts, and alerts)
+        val isWeatherAvailable = uiState.forecastDays.isNotEmpty() && uiState.meteoDataMode != TelemetryDataMode.UNAVAILABLE
+        val rawWeatherDate = todayMeteo?.dateIso ?: uiState.meteoObservationTimestampIso.takeIf { it.isNotBlank() }
+        val parsedWeatherDate = OpenMeteoClient.parseValidIsoDateOrNull(rawWeatherDate)
+        val hasInvalidWeatherTimestamp = !rawWeatherDate.isNullOrBlank() && parsedWeatherDate == null
+        val weatherAgeDays = parsedWeatherDate?.let {
+            ChronoUnit.DAYS.between(it, referenceDate).coerceAtLeast(0L)
+        }
+        val isWeatherStale = isWeatherAvailable && (
+            hasInvalidWeatherTimestamp ||
+                !OpenMeteoClient.isObservationTimestampFresh(
+                    observationTimestampIso = rawWeatherDate,
+                    referenceDate = referenceDate,
+                    maxAgeDays = WEATHER_STALE_THRESHOLD_DAYS
+                ) ||
+                uiState.isServingFromRoomOfflineCache
+            )
+        val weatherDataMode: TelemetryDataMode = when {
+            !isWeatherAvailable -> TelemetryDataMode.UNAVAILABLE
+            uiState.isServingFromRoomOfflineCache || uiState.meteoDataMode == TelemetryDataMode.CACHED -> TelemetryDataMode.CACHED
+            uiState.activeFarmer.isDemoAccount || uiState.meteoDataMode == TelemetryDataMode.DEMO || uiState.meteoDataMode == TelemetryDataMode.DEMO_ESTIMATED ->
+                TelemetryDataMode.DEMO
+            uiState.isLiveMeteoConnected && uiState.meteoDataMode == TelemetryDataMode.LIVE -> TelemetryDataMode.LIVE
+            else -> TelemetryDataMode.FALLBACK
+        }
+        val weatherDataStatus: ScientificDataStatus = when {
+            !isWeatherAvailable -> ScientificDataStatus.UNAVAILABLE
+            isWeatherStale -> ScientificDataStatus.STALE
+            weatherDataMode == TelemetryDataMode.LIVE -> ScientificDataStatus.LIVE
+            weatherDataMode == TelemetryDataMode.CACHED -> ScientificDataStatus.CACHED
+            weatherDataMode == TelemetryDataMode.DEMO || weatherDataMode == TelemetryDataMode.DEMO_ESTIMATED -> ScientificDataStatus.DEMO
+            else -> ScientificDataStatus.FALLBACK
+        }
+        val weatherSourceLabel = when (weatherDataStatus) {
+            ScientificDataStatus.LIVE -> "أرصاد Open-Meteo الحية (FAO-56 API)"
+            ScientificDataStatus.CACHED -> "أرصاد مخزنة محلياً (Room Offline Cache)"
+            ScientificDataStatus.STALE -> "أرصاد قديمة/مخزنة تحتاج تحديثاً (${rawWeatherDate ?: "غير مؤرخة"})"
+            ScientificDataStatus.DEMO -> "نموذج أرصاد استرشادي لحساب تجريبي (Demo Mode)"
+            ScientificDataStatus.FALLBACK -> "نموذج الأرصاد الاحتياطي غير المتصل (Offline Fallback Baseline)"
+            ScientificDataStatus.MISSING, ScientificDataStatus.UNAVAILABLE -> "بيانات الأرصاد غير متوفرة حالياً (UNAVAILABLE)"
+        }
+
+        val irrigationDataStatus: ScientificDataStatus = when {
+            !isIrrigationAvailable -> ScientificDataStatus.MISSING
+            weatherDataStatus == ScientificDataStatus.LIVE && satelliteDataStatus == ScientificDataStatus.LIVE -> ScientificDataStatus.LIVE
+            weatherDataStatus == ScientificDataStatus.STALE || satelliteDataStatus == ScientificDataStatus.STALE -> ScientificDataStatus.STALE
+            weatherDataStatus == ScientificDataStatus.CACHED || satelliteDataStatus == ScientificDataStatus.CACHED -> ScientificDataStatus.CACHED
+            uiState.activeFarmer.isDemoAccount -> ScientificDataStatus.DEMO
+            else -> ScientificDataStatus.FALLBACK
+        }
+
         val irrigationSummary = IrrigationContextSummary(
             isAvailable = isIrrigationAvailable,
             calculationDateIso = calculationDateIso,
-            dataSourceLabel = "محرك FAO-56 Penman-Monteith المدمج (Sentinel-2 + Open-Meteo)",
+            dataSourceLabel = "محرك FAO-56 Penman-Monteith (${weatherSourceLabel})",
             et0MmDay = et0MmDay,
             baseKc = baseKc,
             fusedKc = fusedKc,
@@ -600,34 +716,19 @@ object AgriculturalContextProvider {
             immediateIrrigationActionAr = report.immediateIrrigationActionAr,
             targetedPreventiveActionAr = report.targetedPreventiveActionAr,
             weeklyScheduleSummary = weeklyScheduleItems,
-            recentIrrigationLogs = fieldIrrigationLogs
+            recentIrrigationLogs = fieldIrrigationLogs,
+            dataStatus = irrigationDataStatus,
+            qualitySummaryAr = "حساب حتمي بمعادلة FAO-56 Penman-Monteith و FAO-29 لغسيل الأملاح (حالة مدخلات الأرصاد: ${weatherDataStatus.name})",
+            historicalAvailabilityAr = if (fieldIrrigationLogs.isNotEmpty()) {
+                "متوفر (${fieldIrrigationLogs.size} سجل ري ومعاملات سابق للحقل)"
+            } else {
+                "لا توجد سجلات ري منفذة سابقة لهذا الحقل"
+            }
         )
-
-        // D. Environmental Context (Open-Meteo observations, forecasts, and alerts)
-        val isWeatherAvailable = uiState.forecastDays.isNotEmpty()
-        val rawWeatherDate = todayMeteo?.dateIso
-        val parsedWeatherDate = parseIsoDateOrNull(rawWeatherDate)
-        val weatherAgeDays = parsedWeatherDate?.let {
-            ChronoUnit.DAYS.between(it, referenceDate).coerceAtLeast(0L)
-        }
-        val isWeatherStale = isWeatherAvailable && (
-            (weatherAgeDays != null && weatherAgeDays > WEATHER_STALE_THRESHOLD_DAYS) ||
-                uiState.isServingFromRoomOfflineCache
-            )
-        val weatherDataMode = when {
-            uiState.isLiveMeteoConnected && !uiState.isServingFromRoomOfflineCache -> TelemetryDataMode.LIVE
-            uiState.isServingFromRoomOfflineCache -> TelemetryDataMode.CACHED
-            else -> TelemetryDataMode.DEMO_ESTIMATED
-        }
-        val weatherSourceLabel = when (weatherDataMode) {
-            TelemetryDataMode.LIVE -> "أرصاد Open-Meteo الحية (FAO-56 API)"
-            TelemetryDataMode.CACHED -> "أرصاد مخزنة محلياً (Room Offline Cache)"
-            TelemetryDataMode.DEMO_ESTIMATED -> "نموذج الأرصاد الإقليمي المرجعي"
-        }
 
         val environmentalSummary = EnvironmentalContextSummary(
             isAvailable = isWeatherAvailable,
-            dataSourceLabel = weatherSourceLabel,
+            dataSourceLabel = uiState.meteoSource.takeIf { it.isNotBlank() }?.let { "$weatherSourceLabel [$it]" } ?: weatherSourceLabel,
             dataMode = weatherDataMode,
             observationDateIso = parsedWeatherDate?.toString() ?: rawWeatherDate,
             ageDays = weatherAgeDays,
@@ -641,7 +742,15 @@ object AgriculturalContextProvider {
             solarRadiationMjM2 = todayMeteo?.solarRadiationMjM2 ?: 0f,
             et0MmDay = todayMeteo?.et0MmDay ?: et0MmDay,
             forecastDayCount = uiState.forecastDays.size,
-            climaticAlerts = uiState.climaticAlerts
+            climaticAlerts = uiState.climaticAlerts,
+            dataStatus = weatherDataStatus,
+            retrievalTimestampIso = uiState.meteoRetrievalTimestampIso.ifBlank { uiState.lastOfflineCacheSyncIso },
+            units = uiState.meteoUnits,
+            qualitySummaryAr = if (hasInvalidWeatherTimestamp) {
+                "تم رفض طابع زمني غير صالح للطقس ($rawWeatherDate) واعتبار البيانات قديمة (STALE)"
+            } else {
+                "عتبة حداثة الطقس: ≤ $WEATHER_STALE_THRESHOLD_DAYS يوم | الوضع الحالي: ${weatherDataStatus.name}"
+            }
         )
 
         // E. Farm Activity Context

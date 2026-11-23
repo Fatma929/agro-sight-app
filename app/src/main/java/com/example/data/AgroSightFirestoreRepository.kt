@@ -120,10 +120,10 @@ data class FarmerCloudWorkspace(
     val soilPh: Double = 7.8,
     val soilEce: Double = 2.4,
     val waterEcw: Double = 1.4,
-    val ndviMean: Double = 0.72,
-    val ndreMean: Double = 0.24,
-    val psriMean: Double = 0.19,
-    val ndmiMean: Double = 0.31,
+    val ndviMean: Double = 0.0,
+    val ndreMean: Double = 0.0,
+    val psriMean: Double = 0.0,
+    val ndmiMean: Double = 0.0,
     val detectedRiskName: String = "",
     @ServerTimestamp val createdAt: Timestamp? = null,
     @ServerTimestamp val updatedAt: Timestamp? = null
@@ -148,6 +148,7 @@ interface CloudWorkspaceRepository {
     suspend fun signInWithGoogleIdToken(idToken: String): Result<FirebaseUser>
     fun signOut()
     fun observeWorkspace(userId: String): Flow<FarmerCloudWorkspace?>
+    suspend fun fetchFarmerWorkspace(userId: String): Result<FarmerCloudWorkspace?> = Result.success(null)
     fun observeCloudChatLogs(userId: String): Flow<List<CloudChatLog>>
     suspend fun upsertFarmerWorkspace(
         userId: String,
@@ -257,14 +258,57 @@ class AgroSightFirestoreRepository(
             .snapshots()
             .map { snapshot ->
                 if (snapshot.exists()) {
-                    snapshot.toObject(
+                    val parsed = snapshot.toObject(
                         FarmerCloudWorkspace::class.java,
                         DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
                     )
+                    if (parsed != null && parsed.userId.isNotBlank() && parsed.userId != userId) {
+                        null
+                    } else {
+                        parsed?.copy(userId = parsed.userId.ifBlank { userId })
+                    }
                 } else {
                     null
                 }
             }
+    }
+
+    override suspend fun fetchFarmerWorkspace(userId: String): Result<FarmerCloudWorkspace?> {
+        if (userId.isBlank()) {
+            return Result.failure(IllegalArgumentException("userId cannot be blank when fetching cloud workspace"))
+        }
+        val firestore = db ?: return Result.failure(IllegalStateException("Firestore not available"))
+        val currentAuthUser = auth?.currentUser
+            ?: return Result.failure(IllegalStateException("Not authenticated with Firebase Auth"))
+        val authUid = currentAuthUser.uid
+        if (authUid.isBlank() || authUid != userId) {
+            return Result.failure(
+                SecurityException("Cross-user workspace fetch blocked: authenticated UID does not match requested userId")
+            )
+        }
+        return try {
+            val snap = firestore.collection("users").document(userId).get().await()
+            if (!snap.exists()) {
+                Result.success(null)
+            } else {
+                val ws = snap.toObject(
+                    FarmerCloudWorkspace::class.java,
+                    DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+                )
+                if (ws != null && ws.userId.isNotBlank() && ws.userId != userId) {
+                    Result.failure(
+                        SecurityException("Workspace ownership validation failed: workspace.userId != authenticated UID")
+                    )
+                } else {
+                    Result.success(ws?.copy(userId = ws.userId.ifBlank { userId }))
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.GET, "users/$userId")
+            Result.failure(e)
+        }
     }
 
     override fun observeCloudChatLogs(userId: String): Flow<List<CloudChatLog>> {

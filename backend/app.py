@@ -94,26 +94,42 @@ DEFAULT_FIREBASE_PROJECT_ID = "gen-lang-client-0569917869"
 SUPPORTED_ROLES: Set[str] = {"FARMER", "AGRONOMIST_ADMIN", "SUPER_ADMIN"}
 
 
-def _load_project_id_from_google_services() -> str:
-    """Read the authoritative Firebase project_id from environment or app/google-services.json."""
-    env_proj = os.environ.get("FIREBASE_PROJECT_ID", "").strip()
-    if env_proj:
-        return env_proj
+def _resolve_firebase_project_identity() -> Tuple[str, str, bool, bool]:
+    """
+    Resolve the Firebase project_id and return a 4-tuple:
+    (project_id, source, google_services_json_present, using_fallback_project_id)
+    """
     candidates = [
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app", "google-services.json"),
         os.path.join(os.getcwd(), "app", "google-services.json"),
     ]
+    google_services_present = False
+    google_services_pid = ""
     for path in candidates:
         if os.path.exists(path):
+            google_services_present = True
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 pid = str((data.get("project_info") or {}).get("project_id") or "").strip()
-                if pid:
-                    return pid
+                if pid and pid != "remixed-project-id":
+                    google_services_pid = pid
+                    break
             except Exception:
                 pass
-    return DEFAULT_FIREBASE_PROJECT_ID
+
+    env_proj = os.environ.get("FIREBASE_PROJECT_ID", "").strip()
+    if env_proj:
+        return env_proj, "FIREBASE_PROJECT_ID_ENV", google_services_present, False
+    if google_services_pid:
+        return google_services_pid, "GOOGLE_SERVICES_JSON", google_services_present, False
+    return DEFAULT_FIREBASE_PROJECT_ID, "FALLBACK_DEFAULT", google_services_present, True
+
+
+def _load_project_id_from_google_services() -> str:
+    """Read the authoritative Firebase project_id from environment or app/google-services.json."""
+    pid, _, _, _ = _resolve_firebase_project_identity()
+    return pid
 
 
 AUTHORITATIVE_FIREBASE_PROJECT_ID = _load_project_id_from_google_services()
@@ -686,13 +702,82 @@ class SatelliteBackendService:
                     f"Role '{role}' is not authorized to access administrator endpoints",
                 )
 
+    def get_configuration_readiness(self) -> Dict[str, Any]:
+        """
+        Inspect runtime configuration and secret safety without exposing any secret values (Part 9).
+        Never claims production readiness when using fallback project IDs, missing credentials,
+        or auto-generated development signing keys.
+        """
+        resolved_pid, pid_source, google_services_present, using_fallback_from_resolver = _resolve_firebase_project_identity()
+        custom_project_supplied = self.authenticator.project_id != resolved_pid
+        using_fallback_pid = (
+            using_fallback_from_resolver
+            and not custom_project_supplied
+            and self.authenticator.project_id == DEFAULT_FIREBASE_PROJECT_ID
+        )
+        effective_source = "EXPLICIT_AUTHENTICATOR_CONFIG" if custom_project_supplied else pid_source
+
+        cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+        service_account_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+        service_account_configured = bool((cred_path and os.path.exists(cred_path)) or service_account_json)
+
+        placeholder_secrets = {
+            "CHANGE_ME_IN_PRODUCTION_32_BYTE_HMAC_SECRET",
+            "MY_SIGNED_URL_SECRET",
+            "DEFAULT_SECRET",
+        }
+        raw_env_secret = os.environ.get("AGROSIGHT_SIGNED_URL_SECRET", "").strip()
+        signed_url_secret_explicit = bool(
+            raw_env_secret and raw_env_secret not in placeholder_secrets and len(raw_env_secret) >= 32
+        )
+
+        warnings: List[str] = []
+        if using_fallback_pid:
+            warnings.append(
+                "Using fallback DEFAULT_FIREBASE_PROJECT_ID because neither FIREBASE_PROJECT_ID nor app/google-services.json provided a project_id."
+            )
+        if not google_services_present:
+            warnings.append("app/google-services.json was not found on disk.")
+        if not self.authenticator.is_configured:
+            warnings.append(
+                "Firebase Admin SDK credentials are not configured; authenticated endpoints will fail closed (503 FIREBASE_AUTH_NOT_CONFIGURED)."
+            )
+        if not signed_url_secret_explicit:
+            warnings.append(
+                "AGROSIGHT_SIGNED_URL_SECRET is not explicitly set via environment (>=32 chars); using local persisted development key."
+            )
+
+        production_ready = bool(
+            self.authenticator.is_configured
+            and not using_fallback_pid
+            and signed_url_secret_explicit
+        )
+
+        return {
+            "firebase_project_id_source": effective_source,
+            "using_fallback_firebase_project_id": using_fallback_pid,
+            "google_services_json_present": google_services_present,
+            "service_account_configured": service_account_configured,
+            "signed_url_secret_explicitly_configured": signed_url_secret_explicit,
+            "production_ready": production_ready,
+            "configuration_warnings": warnings,
+        }
+
     def get_health(self) -> Tuple[int, Dict[str, Any]]:
         db_stats = self.db.get_admin_summary()
+        readiness = self.get_configuration_readiness()
         return 200, {
             "status": "HEALTHY",
             "service": "AgroSight-Sentinel2-Raster-Backend",
             "version": "4.0.0",
             "firebase_project_id": self.authenticator.project_id,
+            "firebase_project_id_source": readiness["firebase_project_id_source"],
+            "using_fallback_firebase_project_id": readiness["using_fallback_firebase_project_id"],
+            "google_services_json_present": readiness["google_services_json_present"],
+            "service_account_configured": readiness["service_account_configured"],
+            "signed_url_secret_explicitly_configured": readiness["signed_url_secret_explicitly_configured"],
+            "production_ready": readiness["production_ready"],
+            "configuration_warnings": readiness["configuration_warnings"],
             "firebase_auth_configured": self.authenticator.is_configured,
             "firebase_admin_sdk_installed": HAS_FIREBASE_ADMIN_SDK,
             "firebase_admin_sdk_initialized": self.authenticator.firebase_admin_initialized,
