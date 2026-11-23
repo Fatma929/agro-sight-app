@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Official AgroSight Logo Brand Palette -->
+    <color name="agrosight_ivory_bg">#FFFCFBF7</color>
+    <color name="agrosight_primary_green">#FF1E6744</color>
+    <color name="agrosight_primary_green_dark">#FF1C5B40</color>
+    <color name="agrosight_secondary_blue">#FF198AC7</color>
+</resources>
